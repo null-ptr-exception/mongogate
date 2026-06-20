@@ -67,7 +67,6 @@ func VerifyAllData(
 				status := "✅"
 				if !result.Passed { status = "❌" }
 				fmt.Printf("  %s %-45s src=%-8d missing=%-5d diff=%-5d extra_in_target=%-5d\n",
-
 					status, result.NS, result.SrcCount,
 					result.MissingCount, result.DifferentCount, result.ExtraInTarget)
 			}

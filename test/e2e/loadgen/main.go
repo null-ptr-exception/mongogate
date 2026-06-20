@@ -348,6 +348,7 @@ func cmdWrite(args []string) {
 	}
 
 	cli := connect(*uri)
+	collection := cli.Database(*db).Collection(*col)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
