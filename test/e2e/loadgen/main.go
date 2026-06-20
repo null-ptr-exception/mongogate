@@ -148,6 +148,7 @@ func seedBaselineOn(ctx context.Context, cli *mongo.Client, dbName string) {
 	})
 
 	// A view on top of plain_docs.
+	_ = database.Collection("plain_docs_view").Drop(ctx)
 	_ = database.CreateView(ctx, "plain_docs_view", "plain_docs", mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{"count": bson.M{"$gte": 10}}}},
 	})
