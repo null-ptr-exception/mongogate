@@ -518,10 +518,15 @@ func cmdMockWebhook(args []string) {
 
 	var received int
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		received++
 		fmt.Printf("mock-webhook: received #%d: %s\n", received, string(body))
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 	})
 	fmt.Printf("mock-webhook: listening on :%d\n", *port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
