@@ -42,12 +42,24 @@ func VerifyAuth(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report)
 		}
 	}
 
-	// ── Custom Roles ──
+	// ── Custom Roles (name + actual privilege content, not just existence) ──
 	srcRoles, _ := getRoles(ctx, src)
 	tgtRoles, _ := getRoles(ctx, tgt)
-	for role := range srcRoles {
-		if _, ok := tgtRoles[role]; !ok {
+	for role, srcPriv := range srcRoles {
+		tgtPriv, ok := tgtRoles[role]
+		if !ok {
 			errors = append(errors, fmt.Sprintf("❌ Missing role: %s", role))
+			continue
+		}
+		if srcPriv != tgtPriv {
+			errors = append(errors,
+				fmt.Sprintf("⚠️  Role [%s] has different privileges\n     src=%s\n     tgt=%s",
+					role, srcPriv, tgtPriv))
+		}
+	}
+	for role := range tgtRoles {
+		if _, ok := srcRoles[role]; !ok {
+			errors = append(errors, fmt.Sprintf("⚠️  Extra role in target: %s", role))
 		}
 	}
 
@@ -94,21 +106,51 @@ func getUsers(ctx context.Context, client *mongo.Client) (map[string][]string, e
 	return users, nil
 }
 
-func getRoles(ctx context.Context, client *mongo.Client) (map[string]bool, error) {
+// getRoles returns each custom role mapped to a normalized, sorted string of
+// its privileges, so two roles sharing a name can be compared for actual
+// permission content, not just existence.
+func getRoles(ctx context.Context, client *mongo.Client) (map[string]string, error) {
 	result := client.Database("admin").RunCommand(ctx,
-		bson.D{{Key: "rolesInfo", Value: 1}, {Key: "showPrivileges", Value: false}})
+		bson.D{{Key: "rolesInfo", Value: 1}, {Key: "showPrivileges", Value: true}})
 	var res bson.M
 	if err := result.Decode(&res); err != nil {
 		return nil, err
 	}
-	roles := make(map[string]bool)
+	roles := make(map[string]string)
 	arr, _ := res["roles"].(bson.A)
 	for _, r := range arr {
 		rm, _ := r.(bson.M)
 		name, _ := rm["role"].(string)
-		roles[name] = true
+		roles[name] = normalizePrivileges(rm["privileges"])
 	}
 	return roles, nil
+}
+
+// normalizePrivileges renders a role's privilege list as a sorted, stable
+// string (resource + actions per entry) for simple equality comparison.
+func normalizePrivileges(privileges interface{}) string {
+	arr, ok := privileges.(bson.A)
+	if !ok {
+		return ""
+	}
+	var entries []string
+	for _, p := range arr {
+		pm, ok := p.(bson.M)
+		if !ok {
+			continue
+		}
+		resource := fmt.Sprintf("%v", pm["resource"])
+		var actions []string
+		if acts, ok := pm["actions"].(bson.A); ok {
+			for _, a := range acts {
+				actions = append(actions, fmt.Sprintf("%v", a))
+			}
+		}
+		sort.Strings(actions)
+		entries = append(entries, fmt.Sprintf("%s:[%s]", resource, strings.Join(actions, ",")))
+	}
+	sort.Strings(entries)
+	return strings.Join(entries, "|")
 }
 
 func getAuthMechanism(ctx context.Context, client *mongo.Client) string {

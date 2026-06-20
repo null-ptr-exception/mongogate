@@ -238,7 +238,7 @@ in progress — `200` once everything has passed, `500` if anything failed.
 ## Testing
 
 ```bash
-go test ./test/... -v
+go test ./... -v
 ```
 
 Unit tests cover hash normalization and `DeepCompare` classification in

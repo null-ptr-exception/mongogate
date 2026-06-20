@@ -1,8 +1,10 @@
 package utils_test
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -197,4 +199,71 @@ func TestDeepCompare_Identical(t *testing.T) {
 	}
 	passed, diffs := utils.DeepCompare(doc, doc, opts)
 	if !passed { t.Errorf("identical documents should pass, diffs: %v", diffs) }
+}
+
+// ── truncate() must not split a multi-byte UTF-8 character ──
+
+func TestDeepCompare_TruncateMultibyteSafe(t *testing.T) {
+	// 150+ runes, all multi-byte - a byte-offset slice at 120 bytes would
+	// land mid-character and corrupt the value.
+	longStr := strings.Repeat("測試資料字串", 20)
+	src := bson.M{"val": longStr}
+	tgt := bson.M{"val": longStr + "X"} // force a VALUE_DIFF so it goes through truncate()
+
+	passed, diffs := utils.DeepCompare(src, tgt, opts)
+	if passed { t.Fatal("expected a diff") }
+	if len(diffs) == 0 { t.Fatal("expected at least one diff") }
+	for _, d := range diffs {
+		if !utf8.ValidString(d.SrcValue) {
+			t.Errorf("SrcValue is not valid UTF-8 after truncation: %q", d.SrcValue)
+		}
+		if !utf8.ValidString(d.TgtValue) {
+			t.Errorf("TgtValue is not valid UTF-8 after truncation: %q", d.TgtValue)
+		}
+	}
+}
+
+// ── Negative zero must hash the same as positive zero ──
+
+func TestDocHash_NegativeZero(t *testing.T) {
+	var negZero float64
+	negZero = -negZero // produces an actual IEEE-754 negative zero bit pattern
+
+	doc1 := bson.M{"val": negZero}
+	doc2 := bson.M{"val": float64(0)}
+	if utils.DocHash(doc1, opts) != utils.DocHash(doc2, opts) {
+		t.Error("-0.0 and 0.0 are IEEE-754 equal and should hash the same")
+	}
+}
+
+// ── DeepCompare must recurse into arrays of documents ──
+
+func TestDeepCompare_ArrayOfDocsElementDiff(t *testing.T) {
+	src := bson.M{"items": primitive.A{
+		bson.M{"name": "a", "qty": int32(1)},
+		bson.M{"name": "b", "qty": int32(2)},
+	}}
+	tgt := bson.M{"items": primitive.A{
+		bson.M{"name": "a", "qty": int32(1)},
+		bson.M{"name": "b", "qty": int32(99)},
+	}}
+	passed, diffs := utils.DeepCompare(src, tgt, opts)
+	if passed { t.Fatal("expected a diff") }
+	found := false
+	for _, d := range diffs {
+		if d.Path == "items[1].qty" { found = true }
+	}
+	if !found { t.Errorf("expected a diff at items[1].qty, got: %v", diffs) }
+}
+
+func TestDeepCompare_ArrayLengthMismatch(t *testing.T) {
+	src := bson.M{"items": primitive.A{bson.M{"name": "a"}, bson.M{"name": "b"}}}
+	tgt := bson.M{"items": primitive.A{bson.M{"name": "a"}}}
+	passed, diffs := utils.DeepCompare(src, tgt, opts)
+	if passed { t.Fatal("expected a diff") }
+	found := false
+	for _, d := range diffs {
+		if d.IssueType == "ARRAY_LENGTH_MISMATCH" && d.Path == "items" { found = true }
+	}
+	if !found { t.Errorf("expected ARRAY_LENGTH_MISMATCH at items, got: %v", diffs) }
 }
