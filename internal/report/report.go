@@ -163,7 +163,7 @@ func (r *Report) Print() {
 		for _, d := range r.Data {
 			status := "✅"
 			if !d.Passed { status = "❌" }
-			fmt.Printf("  %s %-42s src=%-8d missing=%-6d diff=%-6d extra_in_tgt=%-6d exact=%v\n",
+			fmt.Printf("  %s %-42s src=%-8d missing=%-6d diff=%-6d extra_in_target=%-6d exact=%v\n",
 				status, d.NS, d.SrcCount, d.MissingCount, d.DifferentCount, d.ExtraInTarget, d.HashIsExact)
 			totalMissing += d.MissingCount
 			totalDiff += d.DifferentCount
