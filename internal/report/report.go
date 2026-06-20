@@ -159,16 +159,17 @@ func (r *Report) Print() {
 	}
 	if len(r.Data) > 0 {
 		fmt.Println("\n📊 Data verification:")
-		totalMissing, totalDiff := 0, 0
+		totalMissing, totalDiff, totalExtra := 0, 0, 0
 		for _, d := range r.Data {
 			status := "✅"
 			if !d.Passed { status = "❌" }
-			fmt.Printf("  %s %-42s src=%-8d missing=%-6d diff=%-6d exact=%v\n",
-				status, d.NS, d.SrcCount, d.MissingCount, d.DifferentCount, d.HashIsExact)
+			fmt.Printf("  %s %-42s src=%-8d missing=%-6d diff=%-6d extra_in_tgt=%-6d exact=%v\n",
+				status, d.NS, d.SrcCount, d.MissingCount, d.DifferentCount, d.ExtraInTarget, d.HashIsExact)
 			totalMissing += d.MissingCount
 			totalDiff += d.DifferentCount
+			totalExtra += d.ExtraInTarget
 		}
-		fmt.Printf("\n  Totals: missing=%d different=%d\n", totalMissing, totalDiff)
+		fmt.Printf("\n  Totals: missing=%d different=%d extra_in_target=%d\n", totalMissing, totalDiff, totalExtra)
 	}
 
 	fmt.Println("\n" + line("=", 65))

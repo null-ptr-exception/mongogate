@@ -66,9 +66,9 @@ func VerifyAllData(
 				rpt.SetData(result.NS, result)
 				status := "✅"
 				if !result.Passed { status = "❌" }
-				fmt.Printf("  %s %-45s src=%-8d missing=%-5d diff=%-5d\n",
+				fmt.Printf("  %s %-45s src=%-8d missing=%-5d diff=%-5d extra_in_tgt=%-5d\n",
 					status, result.NS, result.SrcCount,
-					result.MissingCount, result.DifferentCount)
+					result.MissingCount, result.DifferentCount, result.ExtraInTarget)
 			}
 		}()
 	}
@@ -118,6 +118,7 @@ func verifyOneCollection(
 	// ── Reverse: target → source (find docs that only exist in target) ──
 	if opts.Bidirectional {
 		processTgtToSrc(ctx, srcCol, tgtCol, ns, opts, result)
+		am.CheckExtraInTarget(ns, result.ExtraInTarget)
 	}
 
 	bar.Done()

@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: e2e-tools
+  namespace: mongogate-test
+  labels:
+    app: e2e-tools
+spec:
+  containers:
+    - name: tools
+      image: mongogate-e2e-tools:latest
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi

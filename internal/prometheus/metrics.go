@@ -63,6 +63,7 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_passed{ns="%s"} %g`+"\n", label, passed))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_missing{ns="%s"} %d`+"\n", label, data.MissingCount))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_different{ns="%s"} %d`+"\n", label, data.DifferentCount))
+		sb.WriteString(fmt.Sprintf(`mongogate_ns_extra_in_target{ns="%s"} %d`+"\n", label, data.ExtraInTarget))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_src_count{ns="%s"} %d`+"\n", label, data.SrcCount))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_tgt_count{ns="%s"} %d`+"\n", label, data.TgtCount))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_progress_pct{ns="%s"} %g`+"\n", label, data.ProgressPct))

@@ -4,3 +4,4 @@ verify_report_*.json
 diff_*.csv
 *.log
 .DS_Store
+.claude/
