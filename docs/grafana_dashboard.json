@@ -1,0 +1,252 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_MONGODB",
+      "label": "MongoDB Monitor",
+      "type": "datasource",
+      "pluginId": "grafana-mongodb-datasource"
+    }
+  ],
+  "title": "MongoDB Migration Verification Monitor",
+  "uid": "mongo-migration-verify",
+  "schemaVersion": 36,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "ns",
+        "label": "Collection",
+        "type": "query",
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "query": "migration_monitor.verify_metrics.ns",
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Overall Progress",
+      "type": "gauge",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0, "max": 100,
+          "thresholds": {
+            "steps": [
+              { "value": 0,   "color": "red" },
+              { "value": 50,  "color": "yellow" },
+              { "value": 100, "color": "green" }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$group\":{\"_id\":null,\"avg\":{\"$avg\":\"$progress_pct\"}}}]",
+        "mappingType": "field",
+        "fieldMapping": "avg"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "Current Phase",
+      "type": "stat",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "options": { "colorMode": "background" },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$sort\":{\"timestamp\":-1}},{\"$limit\":1},{\"$project\":{\"phase\":1}}]",
+        "mappingType": "field",
+        "fieldMapping": "phase"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "Missing Documents",
+      "type": "stat",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$sort\":{\"timestamp\":-1}},{\"$limit\":1},{\"$project\":{\"missing_count\":1}}]",
+        "mappingType": "field",
+        "fieldMapping": "missing_count"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Different Documents",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 1, "color": "red" }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$sort\":{\"timestamp\":-1}},{\"$limit\":1},{\"$project\":{\"different_count\":1}}]",
+        "mappingType": "field",
+        "fieldMapping": "different_count"
+      }]
+    },
+    {
+      "id": 5,
+      "title": "Verification Progress Trend",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 }
+      },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$match\":{\"ns\":{\"$in\":[\"$ns\"]}}},{\"$sort\":{\"timestamp\":1}},{\"$project\":{\"timestamp\":1,\"progress_pct\":1,\"ns\":1}}]",
+        "mappingType": "timeseries",
+        "timeField": "timestamp",
+        "fieldMapping": "progress_pct",
+        "legendFormat": "{{ns}}"
+      }]
+    },
+    {
+      "id": 6,
+      "title": "Count Diff Trend (should converge to 0)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 11, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "value": 0,    "color": "green" },
+              { "value": 1000, "color": "yellow" },
+              { "value": 10000,"color": "red" }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$sort\":{\"timestamp\":1}},{\"$project\":{\"timestamp\":1,\"count_diff\":1,\"ns\":1}}]",
+        "mappingType": "timeseries",
+        "timeField": "timestamp",
+        "fieldMapping": "count_diff",
+        "legendFormat": "{{ns}}"
+      }]
+    },
+    {
+      "id": 7,
+      "title": "Missing / Different Trend",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 11, "w": 12, "h": 7 },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+          "database": "migration_monitor",
+          "collection": "verify_metrics",
+          "pipeline": "[{\"$sort\":{\"timestamp\":1}},{\"$project\":{\"timestamp\":1,\"missing_count\":1}}]",
+          "mappingType": "timeseries",
+          "timeField": "timestamp",
+          "fieldMapping": "missing_count",
+          "legendFormat": "missing"
+        },
+        {
+          "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+          "database": "migration_monitor",
+          "collection": "verify_metrics",
+          "pipeline": "[{\"$sort\":{\"timestamp\":1}},{\"$project\":{\"timestamp\":1,\"different_count\":1}}]",
+          "mappingType": "timeseries",
+          "timeField": "timestamp",
+          "fieldMapping": "different_count",
+          "legendFormat": "different"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Per-Collection Verification Status",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 18, "w": 24, "h": 10 },
+      "options": {
+        "sortBy": [{ "displayName": "ns" }]
+      },
+      "targets": [{
+        "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+        "database": "migration_monitor",
+        "collection": "verify_metrics",
+        "pipeline": "[{\"$sort\":{\"timestamp\":-1}},{\"$group\":{\"_id\":\"$ns\",\"phase\":{\"$first\":\"$phase\"},\"progress\":{\"$first\":\"$progress_pct\"},\"missing\":{\"$first\":\"$missing_count\"},\"different\":{\"$first\":\"$different_count\"},\"src_count\":{\"$first\":\"$src_count\"},\"duration\":{\"$first\":\"$duration_seconds\"}}},{\"$project\":{\"ns\":\"$_id\",\"phase\":1,\"progress\":1,\"missing\":1,\"different\":1,\"src_count\":1,\"duration\":1,\"_id\":0}}]",
+        "mappingType": "table"
+      }],
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "missing" },
+            "properties": [{
+              "id": "custom.displayMode", "value": "color-background",
+              "thresholds": { "steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "red"}] }
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "different" },
+            "properties": [{
+              "id": "custom.displayMode", "value": "color-background",
+              "thresholds": { "steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "red"}] }
+            }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "progress" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.displayMode", "value": "lcd-gauge" },
+              { "id": "min", "value": 0 },
+              { "id": "max", "value": 100 }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "annotations": {
+    "list": [{
+      "datasource": { "type": "grafana-mongodb-datasource", "uid": "${DS_MONGODB}" },
+      "enable": true,
+      "name": "Migration Events",
+      "database": "migration_monitor",
+      "collection": "verify_events",
+      "pipeline": "[{\"$project\":{\"time\":\"$created_at\",\"text\":\"$message\",\"tags\":[\"$level\"]}}]",
+      "timeField": "time",
+      "textField": "text",
+      "tagsField": "tags"
+    }]
+  }
+}

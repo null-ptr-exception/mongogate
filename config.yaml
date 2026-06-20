@@ -1,0 +1,74 @@
+source_uri: "mongodb://source:27017/?readPreference=secondaryPreferred"
+target_uri: "mongodb://target:27017/?readPreference=secondaryPreferred"
+monitor_uri: "mongodb://monitor:27017/"
+
+# Performance controls
+batch_size: 500
+max_workers: 4
+rate_limit_ms: 10
+timeout_secs: 30
+retry_count: 3
+retry_wait_ms: 500
+
+# Namespace filtering
+skip_dbs:
+  - local
+  - config
+# include_ns:           # only verify these (empty = everything)
+#   - mydb.users
+#   - mydb.*
+# exclude_ns:           # exclude these
+#   - mydb.logs
+
+# Verification switches
+verify:
+  auth: true
+  cluster: true
+  schema: true
+  index: true
+  data: true
+  gridfs: true
+  views: true
+  sharding: false
+  encryption: false
+  bidirectional: true   # also scan target → source (finds extra docs in target)
+
+phase2_lag_threshold_seconds: 10
+sample_rate: 0.1
+
+# Execution mode
+dry_run: false          # true = scan only, no comparison
+auto_repair: false      # true = automatically copy diffs from source to target
+export_csv: "auto"      # "auto" = timestamped filename, "" = disabled, or a specific path
+
+# HTTP API (for CI/CD)
+http_port: 8080         # 0 = disabled
+# GET /health    → service health
+# GET /status    → verification summary
+# GET /progress  → per-namespace progress
+# GET /report    → full JSON report
+# GET /passed    → 200=passed, 500=failed
+
+# Prometheus metrics
+prometheus_port: 9090   # 0 = disabled
+# GET /metrics   → Prometheus text format
+
+# Alerting
+alert:
+  enabled: false
+  slack_webhook: ""     # "https://hooks.slack.com/services/xxx"
+  email_smtp: ""        # "smtp.gmail.com:587"
+  email_from: ""
+  email_to: []
+  missing_threshold: 0      # fires when missing > N (0 = alert on the first one)
+  different_threshold: 0    # fires when different > N
+  stuck_minutes: 10         # fires when progress hasn't moved in N minutes
+
+# Hash normalization options
+hash_options:
+  normalize_datetime: true        # normalize to UTC (required when CDC goes through Kafka)
+  normalize_float_precision: 10   # fixed decimal precision for floats
+  normalize_decimal128: true      # strip trailing zeros from Decimal128
+  sort_arrays: false              # sort arrays (set false if order is business-meaningful)
+  check_binary_subtype: true      # also compare BinData subtype
+  strict_objectid: true           # ObjectId must not degrade to a string

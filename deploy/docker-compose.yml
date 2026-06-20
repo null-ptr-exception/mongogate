@@ -1,0 +1,63 @@
+version: "3.8"
+
+services:
+  # ── Verification tool ──
+  mongogate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - ./checkpoints:/app
+    environment:
+      - TZ=UTC
+    command: ["--phase", "all"]
+    depends_on:
+      - monitor_mongo
+    networks:
+      - verify_net
+
+  # ── Monitor MongoDB (stores time series metrics) ──
+  monitor_mongo:
+    image: mongo:7.0
+    ports:
+      - "27020:27017"
+    volumes:
+      - monitor_data:/data/db
+    networks:
+      - verify_net
+
+  # ── Prometheus ──
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - verify_net
+
+  # ── Grafana ──
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-mongodb-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana_provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+      - monitor_mongo
+    networks:
+      - verify_net
+
+volumes:
+  monitor_data:
+  grafana_data:
+
+networks:
+  verify_net:
+    driver: bridge
