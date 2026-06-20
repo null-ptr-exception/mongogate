@@ -64,6 +64,8 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 13 | Auto-repair | ✅ Repairs sampled diffs correctly |
 | 14 | CSV/JSON output | ✅ Correct after fixing a missing-rows bug (see below) |
 | 15 | CLI/config matrix | ✅ `--dry-run`, `--exclude-ns "db.*"`, multi-entry `include_ns`/`exclude_ns`, combined include+exclude, bad-config validation all correct |
+| 16 | Comparison-logic bugs (UTF-8 truncation, negative zero, role privileges, array-of-docs recursion) | ✅ All 4 confirmed real, fixed, unit- and E2E-tested — see section 6 |
+| 17 | New data formats on MongoDB 8.0 (vector embeddings, time series, clustered collection, collation, hidden index, real geo data, large documents) | ✅ Mostly clean on the first try; found a real structural limitation (time series bucket `_id`) and a real performance characteristic (large-document memory multiplier) — see section 7 |
 
 ### Bugs found and fixed during this pass
 
@@ -325,6 +327,165 @@ else in `mydb`" for views/GridFS specifically; it means "and every
 view/GridFS bucket in `mydb` too." Documented in the README's "Scoping a run"
 section so this doesn't surprise anyone relying on a narrow `include_ns` to
 mean total silence about the rest of the database.
+
+---
+
+## 6. Four logic bugs found by reading the comparison code, then confirmed
+
+A follow-up pass specifically looking for problems in the *comparison logic
+itself* (not missing test coverage) — prompted by being asked to think about
+this like a MongoDB expert, including MongoDB 8.x-era data — turned up four
+real bugs, each confirmed before fixing rather than assumed:
+
+1. **`truncate()` could split a multi-byte UTF-8 character.** It sliced by
+   raw byte offset (`s[:120]`). A Chinese string (directly relevant given
+   this tool's origins) or emoji landing across that boundary would be cut
+   mid-character, corrupting the value shown in reports/CSV. Fixed to slice
+   by rune (`utf8.RuneCountInString` + `[]rune(s)`); covered by
+   `TestDeepCompare_TruncateMultibyteSafe`.
+2. **Negative zero hashed differently from positive zero.** Confirmed by
+   running it: `fmt.Sprintf("f:%.10f", negZero)` produced `"-0.0000000000"`
+   for an actual computed `-0.0`, vs `"0.0000000000"` for `0.0`, even though
+   they're IEEE-754 equal. Any computed value landing on exactly zero (a
+   delta, a count difference) was a false-positive risk. Fixed by clearing
+   the sign bit (`if val == 0 { val = 0 }`) before formatting; covered by
+   `TestDocHash_NegativeZero`.
+3. **Custom role privileges were never actually compared.** `getRoles()`
+   called `rolesInfo` with `showPrivileges: false` — confirmed only role
+   *names* were checked. Two clusters could have a role of the same name
+   granting completely different permissions and mongogate would report a
+   match. Fixed: `showPrivileges: true` plus a new `normalizePrivileges()`
+   that diffs each role's actions/resources, not just its existence.
+   Confirmed end-to-end in the kind cluster (Phase 1's account-permissions
+   check now actually inspects privilege content); unit-tested in
+   `internal/verifier/auth_verifier_test.go`.
+4. **`deepDiff` never recursed into arrays of documents.** A difference
+   buried in one element reported as one opaque "whole array differs"
+   `VALUE_DIFF` instead of a precise path. Fixed: arrays containing at least
+   one document now get per-element recursion with paths like
+   `items[2].name`, and a length mismatch is reported as its own
+   `ARRAY_LENGTH_MISMATCH` rather than folded into a generic value diff.
+   Confirmed both in unit tests (`TestDeepCompare_ArrayOfDocsElementDiff`,
+   `TestDeepCompare_ArrayLengthMismatch`) and live against the kind cluster
+   via `loadgen diverge --scenario array_of_docs_nested_diff` /
+   `array_length_mismatch` — both produced exactly the expected path and
+   issue type in the real JSON report, not just in isolated unit tests.
+
+A fifth, process-level finding from the same pass: CI only ran
+`go test ./test/...`, so a test file living next to the code it tests (as
+Go convention expects, and as the role-privilege fix required, since
+`normalizePrivileges` is private to `internal/verifier`) would have been
+silently skipped. Both CI and the documented test command are now
+`go test ./...`.
+
+---
+
+## 7. New data formats and collection types, tested against MongoDB 8.0
+
+This pass also switched the E2E test images from `mongo:7.0` to `mongo:8.0`
+(confirmed pullable, v8.0.26) and added fixtures for formats/collection types
+that were checked in code but never actually created in the kind cluster.
+
+**Clean on the first try:** non-default collation (case-insensitive,
+`{locale: "en", strength: 2}`), a clustered collection (`clusteredIndex`),
+a hidden index, real GeoJSON `Point` data under the 2dsphere index, and a
+1536-dimension embedding-style float array (the shape of a real OpenAI/Atlas
+Vector Search vector) — all compared correctly in Phase 1 and Phase 3,
+including `loadgen diverge --scenario vector_embedding_diff`, which perturbs
+one of 1536 dimensions by 0.05 and confirms DeepCompare still catches it at
+that width rather than the comparison cost or normalization tolerance
+breaking down.
+
+**Six new `diverge` scenarios, all classified correctly** in the live
+report, not just unit tests: `null_vs_missing` → `MISSING_FIELD` (confirms
+explicit `null` and a missing key are treated as a real difference, not
+silently equivalent — a classic MongoDB semantic distinction), `regex_field`
+→ `VALUE_DIFF`, `timestamp_field` (BSON Timestamp, not Date) → `VALUE_DIFF`,
+`minmaxkey_field` → `TYPE_MISMATCH` (correctly distinguishes `MinKey` from
+`MaxKey`, though `SrcType`/`TgtType` render as Go's internal names —
+`primitive.MinKey`/`primitive.MaxKey` — rather than clean BSON type names;
+functionally correct, cosmetically rough, not fixed this pass).
+
+**A genuine structural finding, not a bug: Time Series collections.**
+`timeseries_col` itself failed Phase 3 at first — `missing` and
+`extra_in_target` both non-zero despite inserting byte-identical
+measurements on both sides. The cause: time series measurement documents
+auto-generate an ObjectID `_id` at insert time if none is given, and two
+independent `InsertMany` calls mint different ones — confirmed by directly
+comparing the `_id` values on each side. Giving the measurements an explicit
+`_id` fixed `timeseries_col` itself. **The underlying
+`system.buckets.timeseries_col` storage still failed afterward** — its own
+`_id` is server-generated from internal bucket state and is not something a
+client can control at all, unlike the measurement documents. This is a real
+ceiling, not a test artifact: confirmed the practical workaround is the same
+one already documented for GridFS internals — add the bucket collection to
+`exclude_ns` (`migtest.system.buckets.timeseries_col`) — verified this
+produces a clean Phase 3 pass. **Recommendation for real time-series
+migrations:** exclude `<db>.system.buckets.*` via `exclude_ns` and rely on
+the logical collection (with explicit/preserved `_id`s) for verification.
+
+**A genuine performance finding: large individual documents.** Measured with
+`/usr/bin/time -v` the same way as the existing performance section, but for
+*one* document instead of many small ones:
+
+| Document size | Peak RSS | 
+|---|---|
+| 1MB | 124 MB |
+| 12MB | 917 MB |
+
+This is roughly a 60-70x multiplier of the document's own size, not the flat
+~60-70MB measured earlier against 200,000 small (≈300-byte) documents in the
+same cluster. The "constant memory" design holds for *many small documents*
+(the batching/streaming design this tool is built around), but **does not
+hold for individual large documents** — each one is fully decoded into a
+`bson.M`, re-normalized into a fresh sorted map, and JSON-marshaled for
+hashing, for both source and target, and DeepCompare's two-pass design
+(hash, then re-normalize again on mismatch) compounds that further. A
+migration with a handful of multi-megabyte documents (large embedded
+binaries, big arrays) will see memory scale with the largest document it
+encounters, not stay flat at the documented baseline. Not a bug to fix this
+pass — a real characteristic worth knowing before assuming the memory
+ceiling is universal.
+
+---
+
+## Known limitations
+
+Found and deliberately left alone this pass, rather than implemented or
+worked around:
+
+- **Sharded clusters** (mongos + config servers) were never tested — every
+  scenario in this document ran against replica sets. `verify.sharding`
+  exists in the verifier code (shard count + shard key comparison) but
+  wasn't exercised against a real sharded topology; standing one up in kind
+  is a large enough infra lift that it was explicitly deferred rather than
+  rushed.
+- **Deprecated BSON types** — JavaScript, CodeWithScope, Symbol, and
+  DBPointer have no case in `typeName()`/`normalizeValue()`; they'd fall
+  through to Go's default `%T`/`%v` formatting instead of a clean BSON type
+  name. All four have been deprecated since MongoDB 4.4 with negligible
+  presence in active migrations, so this is documented rather than
+  implemented.
+- **Vector Search / Atlas Search index definitions are structurally
+  invisible.** They're created via `createSearchIndex()` and live in a
+  separate catalog managed by `mongot`, not reachable through the
+  `listIndexes` command `VerifyIndexes` actually calls. Confirmed `mongot`
+  isn't present in the Community `mongo:8.0` image used throughout this
+  testing pass (`which mongot` → not found) — it requires Atlas or
+  Enterprise tooling. This means Phase 1 will report a clean index match
+  while never having looked at vector/search indexes at all. The
+  *underlying vector data* (embedding arrays) is ordinary BSON data and
+  **is** verified correctly (see section 7) — it's specifically the search
+  index *definition* that's out of reach.
+- **Queryable Encryption (QE) fields cannot be meaningfully verified by this
+  design at all.** Encrypted values use a fresh IV per encryption, so even
+  a 100%-correct migration re-encrypts to different ciphertext bytes for the
+  same plaintext. mongogate has no key material to decrypt and compare
+  plaintext, so QE fields will report as different regardless of whether
+  the migration is correct. This isn't a missing feature to implement — the
+  `verify.encryption` config flag is already a confirmed no-op (declared in
+  `internal/config/config.go`, never read anywhere else) — it's a ceiling on
+  what hash-based comparison can ever tell you about encrypted data.
 
 ---
 

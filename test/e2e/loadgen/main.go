@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -36,6 +37,8 @@ func main() {
 		cmdSeedBaseline(args)
 	case "seed-users":
 		cmdSeedUsers(args)
+	case "seed-large-doc":
+		cmdSeedLargeDoc(args)
 	case "diverge":
 		cmdDiverge(args)
 	case "write":
@@ -141,11 +144,84 @@ func seedBaselineOn(ctx context.Context, cli *mongo.Client, dbName string) {
 		Keys: bson.D{{Key: "content", Value: "text"}},
 	})
 
-	// 2dsphere (geo) index.
+	// 2dsphere (geo) index, with real GeoJSON data under it - previously
+	// only the index definition was ever compared, never actual geo data.
 	geoCol := database.Collection("geo_col")
 	_, _ = geoCol.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{{Key: "loc", Value: "2dsphere"}},
 	})
+	_, _ = geoCol.DeleteMany(ctx, bson.M{})
+	_, _ = geoCol.InsertMany(ctx, []interface{}{
+		bson.M{"_id": "geo-0", "name": "Taipei 101", "loc": bson.M{"type": "Point", "coordinates": bson.A{121.5645, 25.0330}}},
+		bson.M{"_id": "geo-1", "name": "Tokyo Tower", "loc": bson.M{"type": "Point", "coordinates": bson.A{139.7454, 35.6586}}},
+	})
+
+	// Hidden index - identical (hidden on both sides) in the clean baseline;
+	// drift between sides is exercised separately during the live E2E run.
+	_, _ = plain.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "name", Value: 1}},
+		Options: options.Index().SetHidden(true),
+	})
+
+	// Non-default collation (case-insensitive), with documents that only
+	// differ by case to exercise comparison/sort behavior, not just the
+	// option string.
+	_ = database.Collection("collation_col").Drop(ctx)
+	_ = database.CreateCollection(ctx, "collation_col", options.CreateCollection().
+		SetCollation(&options.Collation{Locale: "en", Strength: 2}))
+	collationCol := database.Collection("collation_col")
+	_, _ = collationCol.InsertMany(ctx, []interface{}{
+		bson.M{"_id": "coll-0", "name": "Alice"},
+		bson.M{"_id": "coll-1", "name": "alice"},
+	})
+
+	// Clustered collection (clusteredIndex option) - never created/tested
+	// end-to-end before, only its option string was compared.
+	_ = database.Collection("clustered_col").Drop(ctx)
+	_ = database.CreateCollection(ctx, "clustered_col", options.CreateCollection().
+		SetClusteredIndex(bson.M{"key": bson.M{"_id": 1}, "unique": true}))
+	clusteredCol := database.Collection("clustered_col")
+	_, _ = clusteredCol.InsertMany(ctx, []interface{}{
+		bson.M{"_id": "clu-0", "val": "a"},
+		bson.M{"_id": "clu-1", "val": "b"},
+	})
+
+	// Real Time Series collection - previously only the `timeseries` option
+	// string was compared in Phase 1, never an actual one created, so it was
+	// unknown whether its internal system.buckets.* storage would confuse
+	// the generic data verifier the way fs.files/fs.chunks did.
+	_ = database.Collection("timeseries_col").Drop(ctx)
+	_ = database.CreateCollection(ctx, "timeseries_col", options.CreateCollection().
+		SetTimeSeriesOptions(options.TimeSeries().SetTimeField("ts").SetMetaField("meta")))
+	tsCol := database.Collection("timeseries_col")
+	fixedTS := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) // fixed, not time.Now() - see GridFS note above
+	_, _ = tsCol.InsertMany(ctx, []interface{}{
+		// Explicit _id: time series measurement documents auto-generate an
+		// ObjectID at insert time if one isn't given, which would differ
+		// between independently-seeded sides even with identical data -
+		// see docs/TESTING.md for what's still unfixable underneath this.
+		bson.M{"_id": "ts-0", "ts": fixedTS, "meta": bson.M{"sensor": "a"}, "value": 1.5},
+		bson.M{"_id": "ts-1", "ts": fixedTS.Add(time.Minute), "meta": bson.M{"sensor": "a"}, "value": 2.5},
+	})
+
+	// High-dimensional embedding-style vectors (the shape of a real
+	// Atlas/OpenAI vector search embedding) - checks normalizeArray/hashing
+	// behavior and float-precision strictness at realistic width. The
+	// Vector Search *index* itself is out of scope (see docs/TESTING.md
+	// "Known limitations" - it lives in a separate mongot-managed catalog
+	// this tool cannot see).
+	_ = database.Collection("vector_col").Drop(ctx)
+	vectorCol := database.Collection("vector_col")
+	const dims = 1536
+	var vectorDocs []interface{}
+	for i := 0; i < 3; i++ {
+		vec := make(bson.A, dims)
+		for j := 0; j < dims; j++ {
+			vec[j] = math.Sin(float64(i*dims + j))
+		}
+		vectorDocs = append(vectorDocs, bson.M{"_id": fmt.Sprintf("vec-%d", i), "embedding": vec})
+	}
+	_, _ = vectorCol.InsertMany(ctx, vectorDocs)
 
 	// A view on top of plain_docs.
 	_ = database.Collection("plain_docs_view").Drop(ctx)
@@ -220,6 +296,44 @@ func createUserIfAbsent(ctx context.Context, cli *mongo.Client, user, pass strin
 	if err != nil {
 		log.Printf("createUser %s failed: %v", user, err)
 	}
+}
+
+// ── seed-large-doc ───────────────────────────────────────────────────────────
+// Inserts one identical, near-16MB document (BSON's hard document size
+// ceiling) on both sides - a sanity check that the streaming/constant-memory
+// design holds for one huge document, not just many small ones. Kept as its
+// own subcommand rather than folded into seed-baseline, which runs
+// frequently throughout testing and shouldn't pay this cost every time.
+
+func cmdSeedLargeDoc(args []string) {
+	fs := flag.NewFlagSet("seed-large-doc", flag.ExitOnError)
+	src := fs.String("src", "", "source mongo URI")
+	tgt := fs.String("tgt", "", "target mongo URI")
+	db := fs.String("db", "migtest", "database name")
+	col := fs.String("col", "large_doc_col", "collection name")
+	sizeMB := fs.Int("size-mb", 12, "approximate document size in MB (BSON cap is 16MB)")
+	_ = fs.Parse(args)
+	if *src == "" || *tgt == "" {
+		log.Fatal("--src and --tgt are required")
+	}
+
+	// A deterministic (not random) payload so both sides are byte-identical.
+	payload := make([]byte, *sizeMB*1024*1024)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+	doc := bson.M{"_id": "large-doc-0", "payload": payload}
+
+	ctx := context.Background()
+	srcCli := connect(*src)
+	tgtCli := connect(*tgt)
+	srcCol := srcCli.Database(*db).Collection(*col)
+	tgtCol := tgtCli.Database(*db).Collection(*col)
+	_, _ = srcCol.DeleteMany(ctx, bson.M{"_id": "large-doc-0"})
+	_, _ = tgtCol.DeleteMany(ctx, bson.M{"_id": "large-doc-0"})
+	mustInsert(ctx, srcCol, doc)
+	mustInsert(ctx, tgtCol, doc)
+	fmt.Printf("seed-large-doc: inserted ~%dMB document on both sides\n", *sizeMB)
 }
 
 // ── diverge ─────────────────────────────────────────────────────────────────
@@ -311,6 +425,62 @@ func runScenario(ctx context.Context, scenario, id string, srcCol, tgtCol *mongo
 	case "array_order":
 		mustInsert(ctx, srcCol, bson.M{"_id": id, "tags": bson.A{"a", "b", "c"}})
 		mustInsert(ctx, tgtCol, bson.M{"_id": id, "tags": bson.A{"c", "a", "b"}})
+
+	case "null_vs_missing":
+		// MongoDB treats {a:null} and a missing "a" differently in some
+		// query contexts, even though both are common stand-ins for
+		// "no value." DeepCompare should report this as a real diff, not
+		// silently treat them as equivalent.
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "val": nil})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id})
+
+	case "regex_field":
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "pattern": primitive.Regex{Pattern: "^foo", Options: "i"}})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id, "pattern": primitive.Regex{Pattern: "^bar", Options: "i"}})
+
+	case "timestamp_field":
+		// BSON Timestamp (oplog-style {t, i}), distinct from a regular Date.
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "ts": primitive.Timestamp{T: 1000, I: 1}})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id, "ts": primitive.Timestamp{T: 1000, I: 2}})
+
+	case "minmaxkey_field":
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "bound": primitive.MinKey{}})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id, "bound": primitive.MaxKey{}})
+
+	case "array_of_docs_nested_diff":
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "items": bson.A{
+			bson.M{"name": "a", "qty": int32(1)},
+			bson.M{"name": "b", "qty": int32(2)},
+		}})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id, "items": bson.A{
+			bson.M{"name": "a", "qty": int32(1)},
+			bson.M{"name": "b", "qty": int32(99)},
+		}})
+
+	case "array_length_mismatch":
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "items": bson.A{
+			bson.M{"name": "a"}, bson.M{"name": "b"}, bson.M{"name": "c"},
+		}})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id, "items": bson.A{
+			bson.M{"name": "a"},
+		}})
+
+	case "vector_embedding_diff":
+		// Same shape as the seed-baseline vector_col fixture, but with one
+		// dimension perturbed by an amount well above the float-precision
+		// normalization tolerance, to confirm a real corruption is still
+		// caught at realistic embedding width (not swallowed by rounding).
+		const dims = 1536
+		srcVec := make(bson.A, dims)
+		tgtVec := make(bson.A, dims)
+		for j := 0; j < dims; j++ {
+			v := math.Cos(float64(j))
+			srcVec[j] = v
+			tgtVec[j] = v
+		}
+		tgtVec[42] = tgtVec[42].(float64) + 0.05
+		mustInsert(ctx, srcCol, bson.M{"_id": id, "embedding": srcVec})
+		mustInsert(ctx, tgtCol, bson.M{"_id": id, "embedding": tgtVec})
 
 	default:
 		log.Fatalf("unknown scenario: %s", scenario)

@@ -466,6 +466,13 @@ type DiffDetail struct {
 | `MISSING_FIELD` | Target is missing a field | CDC dropped a field |
 | `EXTRA_FIELD` | Target has an extra field | CDC added a field |
 | `MISSING_DOC` | Target is missing the whole document | migration never copied it |
+| `ARRAY_LENGTH_MISMATCH` | An array of documents has a different element count | replay missed/duplicated an array element |
+
+Arrays of plain values (strings, numbers) are compared as a single
+normalized value, same as any other field. Arrays containing at least one
+document get recursed into element-by-element, with paths like
+`items[2].name` — so a difference nested inside one array element is
+reported precisely instead of as one opaque "the whole array differs."
 
 ---
 
@@ -525,6 +532,14 @@ Single worker: 500 KB
 Compare to mongosync: 8–16 GB
 Compare to Debezium:  4–8 GB
 ```
+
+This holds for the assumption it's built on — many small documents (~1KB),
+with batching keeping the concurrently-held set fixed. It does **not** hold
+per individual document: a single document is fully decoded, re-normalized,
+and JSON-marshaled for hashing (for both source and target), so memory
+scales with the size of the largest document encountered, not the documented
+baseline. Measured, not assumed: see `docs/TESTING.md`'s large-document
+findings (a single 12MB document drove peak RSS to ~917MB).
 
 ### Throughput (estimated, 4 workers)
 
@@ -939,7 +954,7 @@ monitor_uri: "mongodb://monitor:27017/"
 ### Tests
 
 ```bash
-go test ./test/... -v
+go test ./... -v
 
 # Sample output:
 # --- PASS: TestDocHash_SameDocSameHash (0.00s)

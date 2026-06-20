@@ -45,7 +45,7 @@ spec:
     spec:
       initContainers:
         - name: copy-keyfile
-          image: mongo:7.0
+          image: mongo:8.0
           command:
             - sh
             - -c
@@ -58,7 +58,7 @@ spec:
               mountPath: /etc/mongo-keyfile
       containers:
         - name: mongod
-          image: mongo:7.0
+          image: mongo:8.0
           command:
             - mongod
             - --replSet=rs0

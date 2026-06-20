@@ -27,7 +27,7 @@ spec:
     spec:
       containers:
         - name: mongod
-          image: mongo:7.0
+          image: mongo:8.0
           command: ["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB=0.25"]
           ports:
             - containerPort: 27017
