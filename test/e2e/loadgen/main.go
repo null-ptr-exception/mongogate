@@ -105,9 +105,9 @@ func seedBaselineOn(ctx context.Context, cli *mongo.Client, dbName string) {
 	_, _ = plain.InsertMany(ctx, docs)
 
 	// Capped collection.
+	_ = database.Collection("capped_col").Drop(ctx)
 	_ = database.CreateCollection(ctx, "capped_col", options.CreateCollection().
 		SetCapped(true).SetSizeInBytes(1048576).SetMaxDocuments(1000))
-
 	// Validator.
 	_ = database.CreateCollection(ctx, "validated_col", options.CreateCollection().
 		SetValidator(bson.M{
@@ -148,6 +148,7 @@ func seedBaselineOn(ctx context.Context, cli *mongo.Client, dbName string) {
 	})
 
 	// A view on top of plain_docs.
+	_ = database.Collection("plain_docs_view").Drop(ctx)
 	_ = database.CreateView(ctx, "plain_docs_view", "plain_docs", mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{"count": bson.M{"$gte": 10}}}},
 	})
@@ -319,7 +320,7 @@ func runScenario(ctx context.Context, scenario, id string, srcCol, tgtCol *mongo
 func mustInsert(ctx context.Context, col *mongo.Collection, doc bson.M) {
 	_, err := col.InsertOne(ctx, doc)
 	if err != nil {
-		log.Printf("insert into %s.%s failed: %v", col.Database().Name(), col.Name(), err)
+		log.Fatalf("insert into %s.%s failed: %v", col.Database().Name(), col.Name(), err)
 	}
 }
 
@@ -339,9 +340,14 @@ func cmdWrite(args []string) {
 	if *uri == "" {
 		log.Fatal("--uri is required")
 	}
+	if *rate <= 0 {
+		log.Fatal("--rate must be > 0")
+	}
+	if *statsEvery <= 0 {
+		log.Fatal("--stats-every must be > 0")
+	}
 
 	cli := connect(*uri)
-	collection := cli.Database(*db).Collection(*col)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
@@ -466,6 +472,9 @@ func cmdMirror(args []string) {
 			fmt.Printf("mirror: replayed=%d dropped=%d\n", replayed, dropped)
 		}
 	}
+	if err := stream.Err(); err != nil && watchCtx.Err() == nil {
+		log.Printf("mirror: change stream error: %v", err)
+	}
 	fmt.Printf("mirror: done replayed=%d dropped=%d\n", replayed, dropped)
 }
 
@@ -509,10 +518,15 @@ func cmdMockWebhook(args []string) {
 
 	var received int
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		received++
 		fmt.Printf("mock-webhook: received #%d: %s\n", received, string(body))
-		w.WriteHeader(200)
+		w.WriteHeader(http.StatusOK)
 	})
 	fmt.Printf("mock-webhook: listening on :%d\n", *port)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
