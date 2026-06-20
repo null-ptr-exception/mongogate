@@ -63,7 +63,7 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 12 | Alerting | ✅ De-dupe confirmed; found and fixed a dropped-final-alert bug |
 | 13 | Auto-repair | ✅ Repairs sampled diffs correctly |
 | 14 | CSV/JSON output | ✅ Correct after fixing a missing-rows bug (see below) |
-| 15 | CLI/config matrix | ✅ `--dry-run`, `--exclude-ns "db.*"`, bad-config validation all correct |
+| 15 | CLI/config matrix | ✅ `--dry-run`, `--exclude-ns "db.*"`, multi-entry `include_ns`/`exclude_ns`, combined include+exclude, bad-config validation all correct |
 
 ### Bugs found and fixed during this pass
 
@@ -275,6 +275,56 @@ Two concrete findings beyond the headline number:
 is directionally true but collection-shaped: it's an aggregate number that
 assumes parallelism across collections, not a guarantee for any single
 collection regardless of size.
+
+---
+
+## 5. Multi-collection scoping and include+exclude combined
+
+The NS-scope generalization (bug fix #4 above) was initially tested only with
+a single collection in `include_ns` and a single whole-database wildcard in
+`exclude_ns`. Two follow-up questions needed real evidence, not just reading
+the `NSFilter`/`DBInScope` code: does a *list* of multiple entries actually
+work, and what happens when `include_ns` and `exclude_ns` are both set at
+once?
+
+**Setup:** seeded the usual baseline (11 collections/views/GridFS in
+`migtest`), then introduced drift on three of them — an extra index each on
+`text_col` and `geo_col`, and dropped `capped_col` from target entirely.
+
+**Multi-entry whitelist** — `include_ns: [migtest.plain_docs,
+migtest.validated_col]`:
+```
+migtest collections (2 collections)
+Indexes: migtest.plain_docs ✅   migtest.validated_col ✅
+🎉 Overall result: ✅ everything passed
+```
+Both drifted/dropped collections are outside the whitelist and never
+compared — the collection-count itself narrows to exactly the 2 listed, and
+the drift never surfaces. Confirms the list form isn't just parsed, it's
+actually applied per entry.
+
+**Whitelist + blacklist combined** — `include_ns: [migtest.*]` plus
+`exclude_ns: [migtest.text_col, migtest.geo_col, migtest.capped_col]`:
+```
+migtest collections (8 collections)     # 11 total minus the 3 excluded
+Indexes: 8 entries, none of the 3 excluded ones present
+🎉 Overall result: ✅ everything passed
+```
+Confirms the two lists genuinely compose: `include_ns` sets the outer scope
+(here, the whole database), `exclude_ns` carves specific collections back out
+of it — and the drift on those 3 is correctly invisible to the run.
+
+**One real, worth-documenting subtlety, not a bug:** in both runs above,
+Views and GridFS were still checked (`✅ PASS Views [migtest] (1 views)`,
+`✅ PASS GridFS [migtest]`) even though neither `plain_docs_view` nor the
+GridFS bucket was named in `include_ns`. `DBInScope` operates at database
+granularity — once any pattern puts a database in scope, every database-level
+check (views, GridFS) runs for it, regardless of which specific collections
+were whitelisted. Scoping to `mydb.one_collection` does not mean "and nothing
+else in `mydb`" for views/GridFS specifically; it means "and every
+view/GridFS bucket in `mydb` too." Documented in the README's "Scoping a run"
+section so this doesn't surprise anyone relying on a narrow `include_ns` to
+mean total silence about the rest of the database.
 
 ---
 

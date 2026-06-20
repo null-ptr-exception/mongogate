@@ -205,9 +205,20 @@ The scope applies consistently across **every** Phase 1 structural check —
 database list, collection list/options, indexes, views, and GridFS — as well
 as Phase 2/3 data verification. Excluding `mydb.*` means mongogate won't
 report on, or even read from, that database at all; excluding a single
-collection leaves the rest of its database in scope. The CLI flags
+collection leaves the rest of its database in scope. `include_ns` is a
+whitelist: once it has any entries, only matching namespaces are verified and
+everything else is skipped, regardless of `exclude_ns`; with `include_ns`
+empty (the default), `exclude_ns` acts as a blacklist on top of "verify
+everything." The two compose — `include_ns: [mydb.*]` plus
+`exclude_ns: [mydb.logs]` verifies all of `mydb` except `logs`. The CLI flags
 (`--include-ns`/`--exclude-ns`) only take a single namespace each — for more
 than one, list them in `config.yaml` instead.
+
+**One subtlety:** views and GridFS are checked per-*database*, not
+per-collection, so scoping `include_ns` to a single collection (e.g.
+`mydb.users`) does not silence views or GridFS buckets elsewhere in `mydb` —
+they're still verified as long as any pattern puts that database in scope.
+To exclude those too, exclude the whole database instead.
 
 ## CI/CD integration
 
