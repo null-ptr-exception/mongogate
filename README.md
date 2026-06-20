@@ -248,6 +248,11 @@ primary failover — are answered with a real `kind` cluster; see
 [`docs/TESTING.md`](docs/TESTING.md) for the full scenario matrix, how to
 reproduce it, and the measured results.
 
+Two things this tool **cannot do at all**, by design, not by oversight: see
+[Known limitations](docs/TESTING.md#known-limitations) before relying on it
+for a migration that uses Vector/Atlas Search indexes or Queryable
+Encryption.
+
 Every push and PR runs `go build`/`go vet`/`go test`/`golangci-lint` via
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Every merge to `main`
 builds and pushes a Docker image to `ghcr.io/null-ptr-exception/mongogate`

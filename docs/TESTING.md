@@ -451,41 +451,53 @@ ceiling is universal.
 
 ## Known limitations
 
-Found and deliberately left alone this pass, rather than implemented or
-worked around:
+Not all "limitation" means the same thing. The table below ranks these by
+whether they're actually fixable, so it's not necessary to read all four
+write-ups below just to know which is which:
 
-- **Sharded clusters** (mongos + config servers) were never tested — every
-  scenario in this document ran against replica sets. `verify.sharding`
-  exists in the verifier code (shard count + shard key comparison) but
-  wasn't exercised against a real sharded topology; standing one up in kind
-  is a large enough infra lift that it was explicitly deferred rather than
-  rushed.
-- **Deprecated BSON types** — JavaScript, CodeWithScope, Symbol, and
-  DBPointer have no case in `typeName()`/`normalizeValue()`; they'd fall
-  through to Go's default `%T`/`%v` formatting instead of a clean BSON type
-  name. All four have been deprecated since MongoDB 4.4 with negligible
-  presence in active migrations, so this is documented rather than
-  implemented.
-- **Vector Search / Atlas Search index definitions are structurally
-  invisible.** They're created via `createSearchIndex()` and live in a
-  separate catalog managed by `mongot`, not reachable through the
-  `listIndexes` command `VerifyIndexes` actually calls. Confirmed `mongot`
-  isn't present in the Community `mongo:8.0` image used throughout this
-  testing pass (`which mongot` → not found) — it requires Atlas or
-  Enterprise tooling. This means Phase 1 will report a clean index match
-  while never having looked at vector/search indexes at all. The
-  *underlying vector data* (embedding arrays) is ordinary BSON data and
-  **is** verified correctly (see section 7) — it's specifically the search
-  index *definition* that's out of reach.
-- **Queryable Encryption (QE) fields cannot be meaningfully verified by this
-  design at all.** Encrypted values use a fresh IV per encryption, so even
-  a 100%-correct migration re-encrypts to different ciphertext bytes for the
-  same plaintext. mongogate has no key material to decrypt and compare
-  plaintext, so QE fields will report as different regardless of whether
-  the migration is correct. This isn't a missing feature to implement — the
-  `verify.encryption` config flag is already a confirmed no-op (declared in
-  `internal/config/config.go`, never read anywhere else) — it's a ceiling on
-  what hash-based comparison can ever tell you about encrypted data.
+| # | Item | Category | Fixable? |
+|---|------|----------|----------|
+| 1 | Sharded clusters | Untested (deferred) | **Yes** — just needs the kind infra built; nothing about the design prevents it |
+| 2 | Deprecated BSON types | Cosmetic only | **Yes, trivially** — comparison/diff detection already works; only the displayed type name is ugly |
+| 3 | Vector/Atlas Search index definitions | Structural blind spot | **No, not with this approach** — `VerifyIndexes` calls `listIndexes`, which cannot see mongot's catalog at all; would need an entirely different mechanism (talking to mongot/Atlas Search APIs directly) |
+| 4 | Queryable Encryption | Fundamental ceiling | **No, never** — impossible by the design of encryption itself; no amount of engineering on this tool fixes it without the encryption keys |
+
+Items 3 and 4 are the two that are genuinely "cannot verify," not just
+"didn't get to it" — worth reading in full if evaluating whether to rely on
+this tool for a migration that uses either feature.
+
+1. **Sharded clusters** (mongos + config servers) were never tested — every
+   scenario in this document ran against replica sets. `verify.sharding`
+   exists in the verifier code (shard count + shard key comparison) but
+   wasn't exercised against a real sharded topology; standing one up in kind
+   is a large enough infra lift that it was explicitly deferred rather than
+   rushed.
+2. **Deprecated BSON types** — JavaScript, CodeWithScope, Symbol, and
+   DBPointer have no case in `typeName()`/`normalizeValue()`; they'd fall
+   through to Go's default `%T`/`%v` formatting instead of a clean BSON type
+   name. All four have been deprecated since MongoDB 4.4 with negligible
+   presence in active migrations, so this is documented rather than
+   implemented.
+3. **Vector Search / Atlas Search index definitions are structurally
+   invisible.** They're created via `createSearchIndex()` and live in a
+   separate catalog managed by `mongot`, not reachable through the
+   `listIndexes` command `VerifyIndexes` actually calls. Confirmed `mongot`
+   isn't present in the Community `mongo:8.0` image used throughout this
+   testing pass (`which mongot` → not found) — it requires Atlas or
+   Enterprise tooling. This means Phase 1 will report a clean index match
+   while never having looked at vector/search indexes at all. The
+   *underlying vector data* (embedding arrays) is ordinary BSON data and
+   **is** verified correctly (see section 7) — it's specifically the search
+   index *definition* that's out of reach.
+4. **Queryable Encryption (QE) fields cannot be meaningfully verified by this
+   design at all.** Encrypted values use a fresh IV per encryption, so even
+   a 100%-correct migration re-encrypts to different ciphertext bytes for the
+   same plaintext. mongogate has no key material to decrypt and compare
+   plaintext, so QE fields will report as different regardless of whether
+   the migration is correct. This isn't a missing feature to implement — the
+   `verify.encryption` config flag is already a confirmed no-op (declared in
+   `internal/config/config.go`, never read anywhere else) — it's a ceiling on
+   what hash-based comparison can ever tell you about encrypted data.
 
 ---
 
