@@ -319,7 +319,7 @@ func runScenario(ctx context.Context, scenario, id string, srcCol, tgtCol *mongo
 func mustInsert(ctx context.Context, col *mongo.Collection, doc bson.M) {
 	_, err := col.InsertOne(ctx, doc)
 	if err != nil {
-		log.Printf("insert into %s.%s failed: %v", col.Database().Name(), col.Name(), err)
+		log.Fatalf("insert into %s.%s failed: %v", col.Database().Name(), col.Name(), err)
 	}
 }
 
