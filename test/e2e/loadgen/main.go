@@ -339,9 +339,14 @@ func cmdWrite(args []string) {
 	if *uri == "" {
 		log.Fatal("--uri is required")
 	}
+	if *rate <= 0 {
+		log.Fatal("--rate must be > 0")
+	}
+	if *statsEvery <= 0 {
+		log.Fatal("--stats-every must be > 0")
+	}
 
 	cli := connect(*uri)
-	collection := cli.Database(*db).Collection(*col)
 
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
