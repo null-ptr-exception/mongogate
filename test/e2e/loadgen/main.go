@@ -466,6 +466,9 @@ func cmdMirror(args []string) {
 			fmt.Printf("mirror: replayed=%d dropped=%d\n", replayed, dropped)
 		}
 	}
+	if err := stream.Err(); err != nil && watchCtx.Err() == nil {
+		log.Printf("mirror: change stream error: %v", err)
+	}
 	fmt.Printf("mirror: done replayed=%d dropped=%d\n", replayed, dropped)
 }
 
