@@ -105,9 +105,9 @@ func seedBaselineOn(ctx context.Context, cli *mongo.Client, dbName string) {
 	_, _ = plain.InsertMany(ctx, docs)
 
 	// Capped collection.
+	_ = database.Collection("capped_col").Drop(ctx)
 	_ = database.CreateCollection(ctx, "capped_col", options.CreateCollection().
 		SetCapped(true).SetSizeInBytes(1048576).SetMaxDocuments(1000))
-
 	// Validator.
 	_ = database.CreateCollection(ctx, "validated_col", options.CreateCollection().
 		SetValidator(bson.M{
