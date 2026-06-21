@@ -39,16 +39,28 @@ jobs:
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
+      - name: Bring up the kind cluster only (no MongoDB yet)
+        working-directory: test/e2e/scripts
+        run: |
+          kind create cluster --config ../kind/cluster-config.yaml
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Build the tools image
+        # Done before any mongod starts, not after: go build/go mod download
+        # is CPU-heavy, and running it concurrently with two already-live
+        # 3-node replica sets starved them of CPU on a standard GHA runner -
+        # confirmed live, this caused sustained (50+ second) AuthenticationFailed
+        # against a node mid-election, not a quick replication blip.
+        run: docker build -f test/e2e/Dockerfile.tools -t mongogate-e2e-tools:latest .
+
       - name: Bring up E2E environment (source forced to match target - true same-version baseline)
         working-directory: test/e2e/scripts
         env:
           SOURCE_MONGO_VERSION: "8.0"
         run: bash setup.sh
 
-      - name: Build and load tools image
-        run: |
-          docker build -f test/e2e/Dockerfile.tools -t mongogate-e2e-tools:latest .
-          kind load docker-image mongogate-e2e-tools:latest --name mongogate-e2e
+      - name: Load tools image into the cluster
+        run: kind load docker-image mongogate-e2e-tools:latest --name mongogate-e2e
 
       - name: Deploy e2e-tools pod
         run: |
@@ -151,16 +163,24 @@ jobs:
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
+      - name: Bring up the kind cluster only (no MongoDB yet)
+        working-directory: test/e2e/scripts
+        run: |
+          kind create cluster --config ../kind/cluster-config.yaml
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Build the tools image
+        # See the happy-path job for why this runs before any mongod starts.
+        run: docker build -f test/e2e/Dockerfile.tools -t mongogate-e2e-tools:latest .
+
       - name: Bring up E2E environment (source = this matrix entry's version)
         working-directory: test/e2e/scripts
         env:
           SOURCE_MONGO_VERSION: ${{ matrix.source_version }}
         run: bash setup.sh
 
-      - name: Build and load tools image
-        run: |
-          docker build -f test/e2e/Dockerfile.tools -t mongogate-e2e-tools:latest .
-          kind load docker-image mongogate-e2e-tools:latest --name mongogate-e2e
+      - name: Load tools image into the cluster
+        run: kind load docker-image mongogate-e2e-tools:latest --name mongogate-e2e
 
       - name: Deploy e2e-tools pod
         run: |
