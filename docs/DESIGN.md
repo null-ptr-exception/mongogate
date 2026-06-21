@@ -307,7 +307,8 @@ confirming the migration is broadly on track.
 | Users | Account list, password hashes (not compared directly) | 1 |
 | Roles | Each user's role list | 1 |
 | Custom roles | Custom role definitions, including inherited sub-roles | 1 |
-| Auth mechanism | Server-wide enabled mechanism list (`authenticationMechanisms`) only - **not** checked per-user (a user could be SCRAM on one side, x.509 on the other, with identical roles, and this would not catch it; see docs/TESTING.md "Known limitations") | 1 |
+| Auth mechanism (server-wide) | Enabled mechanism list (`authenticationMechanisms`) | 1 |
+| Auth mechanism (per-user) | Each user's own `mechanisms` list (e.g. catches a user that's SCRAM-SHA-256-only on one side but offers both SHA-1+SHA-256 on the other, even with identical roles) | 1 |
 | LDAP servers | LDAP server settings | 1 |
 
 ### Cluster layer
@@ -317,15 +318,15 @@ confirming the migration is broadly on track.
 | Replica set protocolVersion | RS protocol version | 1 |
 | writeConcernMajorityJournalDefault | Write-acknowledgment setting | 1 |
 | Replica set topology | Aggregate member count, arbiter count, voting member count, hidden/delayed secondary count (not per-host identity - hostnames always differ between source and target) | 1 |
-| slowOpThresholdMs | Slow-query threshold | 1 |
-| maxIncomingConnections | Max connection count | 1 |
+| slowOpThresholdMs, maxIncomingConnections, notablescan, journalCommitInterval, cursorTimeoutMillis | 5 deliberately-configured server parameters with stable defaults across 4.4-8.0 (not version-gated, so a mismatch is real config drift) | 1 |
 | Shard count | (requires verify.sharding) | 1 |
 | Shard key | Per-collection shard key | 1 |
-| Version / FCV | `buildInfo.version` and `featureCompatibilityVersion` on both sides - informational only, never affects pass/fail, printed in every report header so version-driven diffs elsewhere aren't a surprise | 1 |
+| Version / FCV / default write concern | `buildInfo.version`, `featureCompatibilityVersion`, and `getDefaultRWConcern` on both sides - all informational only, never affect pass/fail (all three are version-driven by design, not config choices - treating a mismatch as an error would fail every cross-version run regardless of correctness), printed in every report header | 1 |
 
-Not checked anywhere: cluster-wide default read/write concern
-(`getDefaultRWConcern`), and only 2 of MongoDB's hundreds of server
-parameters (`slowOpThresholdMs`, `maxIncomingConnections`) - see
+Still not checked: most of MongoDB's hundreds of server parameters (5 of
+them are, see above) - a full fix needs a denylist-based comparison
+(check everything, explicitly exclude what's known to legitimately differ
+by version), deliberately not attempted without that groundwork. See
 docs/TESTING.md "Known limitations".
 
 ### Database layer

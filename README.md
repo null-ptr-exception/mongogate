@@ -39,11 +39,24 @@ Every claim below is backed by command output captured against a real
 3-node MongoDB replica set in `kind`, not assumed from reading the code —
 see [`docs/TESTING.md`](docs/TESTING.md) for the full evidence.
 
-**Confirmed working**, same-version and cross-version (4.4 ↔ 8.0): every
-structural check (auth, cluster, schema, indexes, views), GridFS content
-verification (a real streamed SHA256 — not the `fs.files.md5` field, which
-the driver stopped writing years ago), bidirectional split-brain detection,
-checkpoint/resume, primary failover transparency, alert de-dupe, auto-repair.
+**Confirmed working**, same-version and across the full 4.4 / 5.0 / 6.0 /
+7.0 → 8.0 cross-version matrix: every structural check (auth, cluster,
+schema, indexes, views), GridFS content verification (a real streamed
+SHA256 — not the `fs.files.md5` field, which the driver stopped writing
+years ago), per-user auth mechanism, replica set topology, version/FCV
+info, bidirectional split-brain detection, checkpoint/resume, primary
+failover transparency, alert de-dupe, auto-repair.
+
+The cross-version matrix itself found real, version-specific gaps: a
+collection silently created as the wrong type when the source version
+doesn't support `timeseries`/`clusteredIndex` (MongoDB drops the option
+instead of erroring — now caught directly), and time series' internal
+bucket format/auto-index changing across versions even when the logical
+data is identical (now correctly excluded from raw comparison, same as
+GridFS internals). `7.0 → 8.0` is the only pair with zero structural
+findings; the gaps above are each bounded to a specific version range, not
+"somewhere in 4.4-8.0" — see `docs/TESTING.md` sections 8 and 10 for the
+exact boundaries.
 
 **Permanent limitations, not bugs** (see [Known
 limitations](docs/TESTING.md#known-limitations) for why):
@@ -54,11 +67,18 @@ limitations](docs/TESTING.md#known-limitations) for why):
   encryption, even on a 100%-correct migration. No comparison logic fixes
   this without the encryption keys.
 
-**Known gaps, not yet fixed** (cheap to fix, just not done — see
-docs/TESTING.md for each): per-user auth mechanism (a user could be SCRAM
-on one side, x.509 on the other, same roles, and this wouldn't catch it),
-cluster-wide default read/write concern, and only 2 of MongoDB's hundreds
-of server parameters are checked.
+**One deliberate non-blocking design choice**: default read/write concern
+is surfaced informationally (printed in every report header), never as a
+pass/fail check — it's version-driven (MongoDB's own implicit-default
+calculation changed across versions), so treating a mismatch as an error
+would fail every cross-version run regardless of whether the migration is
+actually fine. Same reasoning already applied to FCV.
+
+**A known gap, not yet fixed**: only 5 of MongoDB's hundreds of server
+parameters are checked. A full fix needs a denylist-based comparison
+(check everything, explicitly exclude what's known to legitimately differ
+by version) rather than guessing at which of the hundreds to add next —
+deliberately not attempted without that groundwork. See docs/TESTING.md.
 
 **Worth knowing about this project's own history**: `cmd/mongogate` — the
 binary this README describes — did not exist as buildable code in any
@@ -174,8 +194,8 @@ etc.): [`docs/DESIGN.md`](docs/DESIGN.md#3-architecture-overview).
 
 | Area | Features |
 |---|---|
-| Security | Users, roles (+ inherited sub-roles), custom roles, server-wide auth mechanism, LDAP |
-| Cluster | Replica set config & topology, sharding, shard keys, server parameters, version/FCV info |
+| Security | Users (+ per-user auth mechanism), roles (+ inherited sub-roles), custom roles, server-wide auth mechanism, LDAP |
+| Cluster | Replica set config & topology, sharding, shard keys, server parameters, version/FCV/default-write-concern info |
 | Schema | DB/collection lists, capped/validator/collation/TTL/time-series/change-stream/clustered-index options |
 | Indexes | Every index attribute: unique, sparse, hidden, TTL, partial filter, text weights, 2dsphere version, wildcard projection, collation |
 | Views | `viewOn`, pipeline, collation |
@@ -231,8 +251,8 @@ the report at all, not even as "skipped."
 
 | Switch | What it checks | Relative cost | Turn off when |
 |---|---|---|---|
-| `auth` | users, roles (+ inherited sub-roles), server-wide auth mechanism, LDAP | cheap | almost never |
-| `cluster` | replica set config/topology, version/FCV info, 2 server params, sharding (if `sharding: true`) | cheap | almost never |
+| `auth` | users (+ per-user auth mechanism), roles (+ inherited sub-roles), server-wide auth mechanism, LDAP | cheap | almost never |
+| `cluster` | replica set config/topology, version/FCV/default-write-concern info, 5 server params, sharding (if `sharding: true`) | cheap | almost never |
 | `schema` | DB/collection lists, collection options (validator, collation, TTL, time series, clustered index, ...) | cheap | almost never |
 | `index` | every index attribute | cheap | almost never |
 | `views` | view definitions | cheap | no views in use |

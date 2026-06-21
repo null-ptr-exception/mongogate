@@ -69,6 +69,7 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 18 | Cross-version source/target (4.4 → 8.0) | ⚠️ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections — fixed (`compareBSONFields` asymmetric skip, `_id_` index skip), re-verified live; plus 3 confirmed-but-not-yet-fixed blind spots (server params, per-user auth mechanism, default RW concern) — see section 8 |
 | 19 | Deeper code review + first-ever real Phase 3 run | ⚠️ Found and fixed 4 more gaps (GridFS content check was dead code, checkpoint file was global not job-scoped, role inheritance never compared, replica topology never compared) plus a regression those fixes would have hit (admin/GridFS-internal collections guarantee false positives under generic comparison) and its proper replacement (dedicated FCV/version info, non-blocking) — see section 9 |
 | 20 | Full version matrix: 4.4/5.0/6.0/7.0 each vs 8.0 | ⚠️ Found a setup-script bug that would have broken on 6.0/7.0 (no legacy `mongo` shell at all), fixed and now auto-detects; found a third instance of the GridFS false-positive pattern in time series bucket internals (fixed); precisely bounded the `clustered_col` gap (4.4/5.0 only) and the time series bucket-format gap (5.0/6.0 only) — 7.0→8.0 is the only pair with zero structural findings — see section 10 |
+| 21 | Closing the 3 remaining blind spots from section 8.4 | ✅ Per-user auth mechanism and server-parameter coverage (2→5 params) fixed as blocking checks, confirmed live; default read/write concern fixed as informational (non-blocking by design, since it's version-driven) — see section 11 |
 
 ### Bugs found and fixed during this pass
 
@@ -889,6 +890,81 @@ comparison is excluded.
 
 ---
 
+## 11. Fixing the 3 remaining detection blind spots from section 8.4
+
+Section 8.4 confirmed three things were never checked: per-user auth
+mechanism, cluster-wide default read/write concern, and all but 2 of
+MongoDB's server parameters. All three addressed now - but not
+identically, because one of them is version-driven and the other two
+aren't, and treating them the same way would have been wrong.
+
+### Per-user auth mechanism - fixed as a blocking check
+
+`getUsers` (`auth_verifier.go`) only ever read `user`/`roles` from
+`usersInfo`; the `mechanisms` field it also returns was never looked at.
+Fixed: `userInfo` now carries both, compared independently so a user with
+identical roles but a different mechanism set (e.g. SCRAM-SHA-256-only on
+one side, both SHA-1+SHA-256 on the other) is reported by name. This is a
+blocking check (added to `errors`) because section 8.4 already confirmed
+empirically this is **not** version-driven - a fresh user gets the same
+default mechanism set on 4.4 through 8.0; a mismatch only happens from
+deliberate config drift, exactly what should block a cutover decision.
+
+Re-verified live: restricted one user to `SCRAM-SHA-256` on target only,
+confirmed `❌ User [appuser] has different auth mechanisms` appears and
+`Account permissions` fails; reverted, confirmed it passes again.
+
+### Default read/write concern - fixed as informational, not blocking
+
+This one *is* version-driven (confirmed live in section 8.4: a fresh 4.4
+cluster reports no `defaultWriteConcern` field at all; a fresh 8.0
+cluster reports `{w:"majority"}` - that's MongoDB's own implicit-default
+calculation changing by version, nothing to do with configuration).
+Treating a mismatch here as a blocking error would fail *every single*
+cross-version run regardless of whether anything is actually wrong with
+the migration - the same reasoning that already applied to FCV.
+
+Fixed by extending `FetchVersionInfo` (the same informational mechanism
+FCV already uses) rather than adding it to `VerifyCluster`'s blocking
+checks: `report.VersionInfo` gained `Src/TgtDefaultWriteConcern`, printed
+in every report header right next to version/FCV. Re-verified live:
+
+```
+Source   : version=4.4.30 fcv=4.4 default_write_concern=(none - implicit per-version default applies)
+Target   : version=8.0.26 fcv=8.0 default_write_concern=map[w:majority wtimeout:0]
+```
+
+This *is* a real limitation worth being explicit about: a human reading
+the report has to notice and interpret this line themselves - it will
+never turn the run red, by design, because doing so would be wrong far
+more often than it would be right.
+
+### Server parameters - expanded the list, still not exhaustive
+
+Went from 2 checked parameters to 5: added `notablescan`,
+`journalCommitInterval`, `cursorTimeoutMillis` - chosen because all three
+are deliberately-configured operational knobs with stable defaults across
+4.4-8.0 (not version-gated), so a mismatch is a real config difference,
+not a version artifact. Re-verified live: diverged all three between
+source and target, confirmed all three are now reported by name.
+
+**Deliberately not done**: switching to a `getParameter: {"*": 1}`
+wildcard comparison against every server parameter MongoDB has. That
+would require building and maintaining a denylist of parameters that
+legitimately differ by version (MongoDB adds new feature-gated parameters
+between major versions regularly, and the asymmetric-skip fix in section
+8.3 means a parameter that only exists on the newer side would now be
+reported every time) - a real architectural improvement, but one that
+needs its own scoped investigation into which parameters are safe to
+include, not something to guess at inside this fix. Still a known,
+explicit gap: most of MongoDB's hundreds of server parameters remain
+unchecked.
+
+All three re-verified together against the same 4.4/8.0 pair after
+`go build && go vet && go test ./... && golangci-lint run` clean.
+
+---
+
 ## Known limitations
 
 Not all "limitation" means the same thing. The table below ranks these by
@@ -901,15 +977,18 @@ write-ups below just to know which is which:
 | 2 | Deprecated BSON types | Cosmetic only | **Yes, trivially** — comparison/diff detection already works; only the displayed type name is ugly |
 | 3 | Vector/Atlas Search index definitions | Structural blind spot | **No, not with this approach** — `VerifyIndexes` calls `listIndexes`, which cannot see mongot's catalog at all; would need an entirely different mechanism (talking to mongot/Atlas Search APIs directly) |
 | 4 | Queryable Encryption | Fundamental ceiling | **No, never** — impossible by the design of encryption itself; no amount of engineering on this tool fixes it without the encryption keys |
-| 5 | Cluster server parameters checked = 2 of hundreds | Confirmed blind spot (section 8.4) | **Yes** — `cluster_verifier.go:33` hardcodes exactly `slowOpThresholdMs`/`maxIncomingConnections`; confirmed a third (`notablescan`) set differently produces no diff. |
-| 6 | Per-user auth mechanism never checked | Confirmed blind spot (section 8.4) | **Yes** — `getUsers` (`auth_verifier.go:87-107`) only reads `user`/`roles`, never `mechanisms`; confirmed same user/roles with different `mechanisms` on each side reports as matching. |
-| 7 | Cluster-wide default read/write concern never checked | Confirmed blind spot (section 8.4) | **Yes** — no code anywhere calls `getDefaultRWConcern`; confirmed a real, version-driven durability-semantics difference (4.4 vs 8.0 implicit write concern) produces no diff. |
+| 5 | Cluster server parameters checked = 5 of hundreds | Partially fixed (section 11) | **Yes, incrementally** — went from 2 to 5 (`slowOpThresholdMs`, `maxIncomingConnections`, `notablescan`, `journalCommitInterval`, `cursorTimeoutMillis`), all confirmed live; a full fix needs a denylist-based wildcard comparison, deliberately not attempted yet — see section 11. |
 
 Items 3 and 4 are the two that are genuinely "cannot verify," not just
 "didn't get to it" — worth reading in full if evaluating whether to rely on
-this tool for a migration that uses either feature. Items 5-7 were found
-and confirmed live in section 8 (cross-version testing) — all fixable, none
-fixed yet; see that section for the evidence behind each.
+this tool for a migration that uses either feature.
+
+Per-user auth mechanism and cluster-wide default read/write concern - both
+listed here in an earlier revision of this table - are fixed; see section
+11. The default RW concern fix is informational-only by design (it's
+version-driven, so a mismatch correctly never fails the run) - that's a
+deliberate design choice, not a remaining gap, but worth knowing it won't
+turn the report red even when the two sides genuinely differ.
 
 Six related and more severe gaps found across sections 8.3 and 9 were fixed
 immediately rather than left listed here: collection/index options using a

@@ -49,10 +49,12 @@ type DataResult struct {
 // them (e.g. a built-in role privilege diff that's actually just a MongoDB
 // version difference, not a migration bug).
 type VersionInfo struct {
-	SrcVersion string `json:"src_version"`
-	TgtVersion string `json:"tgt_version"`
-	SrcFCV     string `json:"src_fcv"`
-	TgtFCV     string `json:"tgt_fcv"`
+	SrcVersion             string `json:"src_version"`
+	TgtVersion             string `json:"tgt_version"`
+	SrcFCV                 string `json:"src_fcv"`
+	TgtFCV                 string `json:"tgt_fcv"`
+	SrcDefaultWriteConcern string `json:"src_default_write_concern"`
+	TgtDefaultWriteConcern string `json:"tgt_default_write_concern"`
 }
 
 type Report struct {
@@ -150,8 +152,10 @@ func (r *Report) Print() {
 	fmt.Printf("   End      : %s\n", r.EndTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("   Duration : %s\n", r.EndTime.Sub(r.StartTime).Round(time.Second))
 	if r.Versions != nil {
-		fmt.Printf("   Source   : version=%s fcv=%s\n", r.Versions.SrcVersion, r.Versions.SrcFCV)
-		fmt.Printf("   Target   : version=%s fcv=%s\n", r.Versions.TgtVersion, r.Versions.TgtFCV)
+		fmt.Printf("   Source   : version=%s fcv=%s default_write_concern=%s\n",
+			r.Versions.SrcVersion, r.Versions.SrcFCV, r.Versions.SrcDefaultWriteConcern)
+		fmt.Printf("   Target   : version=%s fcv=%s default_write_concern=%s\n",
+			r.Versions.TgtVersion, r.Versions.TgtFCV, r.Versions.TgtDefaultWriteConcern)
 	}
 	fmt.Println(line("=", 65))
 

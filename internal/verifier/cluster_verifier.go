@@ -45,7 +45,15 @@ func VerifyCluster(ctx context.Context, src, tgt *mongo.Client,
 	}
 
 	// ── Server Parameters ──
-	params := []string{"slowOpThresholdMs", "maxIncomingConnections"}
+	// Still a finite list, not every parameter MongoDB has (hundreds exist,
+	// many version-gated or internal-only) - these 5 were chosen because
+	// they're deliberately-configured operational knobs with stable
+	// defaults across 4.4-8.0 (not version-driven), so a mismatch here is a
+	// real config difference, not a version artifact.
+	params := []string{
+		"slowOpThresholdMs", "maxIncomingConnections",
+		"notablescan", "journalCommitInterval", "cursorTimeoutMillis",
+	}
 	for _, param := range params {
 		sv := getServerParam(ctx, src, param)
 		tv := getServerParam(ctx, tgt, param)
@@ -72,22 +80,29 @@ func VerifyCluster(ctx context.Context, src, tgt *mongo.Client,
 	printStatus("Cluster settings", res.Passed, "")
 }
 
-// FetchVersionInfo records each side's MongoDB version and FCV on the report
-// as informational, non-blocking context - it never adds to errors or
-// affects Passed. Both confirmed to differ by default on any cross-version
-// pair (different binaries default to different FCV on initiate), and
-// neither was readable anywhere in this codebase before. Deliberately not
-// folded into a generic collection comparison: admin.system.version holds
-// the FCV document, but admin is skipped by default (see config.go) because
+// FetchVersionInfo records each side's MongoDB version, FCV, and default
+// read/write concern on the report as informational, non-blocking context -
+// none of it adds to errors or affects Passed. All three are confirmed to
+// differ by default on any cross-version pair (different binaries default
+// to different FCV on initiate, and MongoDB's implicit default write
+// concern calculation itself changed by version - a fresh 4.4 cluster
+// reports no defaultWriteConcern at all, a fresh 8.0 cluster reports
+// {w:"majority"}), so treating a mismatch here as a blocking error would
+// fail every single cross-version run regardless of whether anything is
+// actually wrong - same reasoning as FCV. Deliberately not folded into a
+// generic collection comparison: admin.system.version holds the FCV
+// document, but admin is skipped by default (see config.go) because
 // raw-comparing the rest of that database guarantees false positives on
 // admin.system.users (fresh SCRAM salt per side) - this is the dedicated,
-// correct way to surface FCV instead of relying on that side effect.
+// correct way to surface both instead of relying on that side effect.
 func FetchVersionInfo(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report) {
 	rpt.SetVersions(&report.VersionInfo{
-		SrcVersion: getBuildInfoVersion(ctx, src),
-		TgtVersion: getBuildInfoVersion(ctx, tgt),
-		SrcFCV:     getFCV(ctx, src),
-		TgtFCV:     getFCV(ctx, tgt),
+		SrcVersion:             getBuildInfoVersion(ctx, src),
+		TgtVersion:             getBuildInfoVersion(ctx, tgt),
+		SrcFCV:                 getFCV(ctx, src),
+		TgtFCV:                 getFCV(ctx, tgt),
+		SrcDefaultWriteConcern: getDefaultWriteConcern(ctx, src),
+		TgtDefaultWriteConcern: getDefaultWriteConcern(ctx, tgt),
 	})
 }
 
@@ -109,6 +124,18 @@ func getFCV(ctx context.Context, client *mongo.Client) string {
 	}
 	fcv, _ := res["featureCompatibilityVersion"].(bson.M)
 	return fmt.Sprintf("%v", fcv["version"])
+}
+
+func getDefaultWriteConcern(ctx context.Context, client *mongo.Client) string {
+	result := client.Database("admin").RunCommand(ctx, bson.D{{Key: "getDefaultRWConcern", Value: 1}})
+	var res bson.M
+	if err := result.Decode(&res); err != nil {
+		return ""
+	}
+	if res["defaultWriteConcern"] == nil {
+		return "(none - implicit per-version default applies)"
+	}
+	return fmt.Sprintf("%v", res["defaultWriteConcern"])
 }
 
 func getReplicaSetConfig(ctx context.Context, client *mongo.Client) bson.M {

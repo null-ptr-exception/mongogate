@@ -24,16 +24,27 @@ func VerifyAuth(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report)
 	}
 	tgtUsers, _ := getUsers(ctx, tgt)
 
-	for username, srcRoles := range srcUsers {
-		tgtRoles, ok := tgtUsers[username]
+	for username, srcUser := range srcUsers {
+		tgtUser, ok := tgtUsers[username]
 		if !ok {
 			errors = append(errors, fmt.Sprintf("❌ Missing user: %s", username))
 			continue
 		}
-		if !slices.Equal(srcRoles, tgtRoles) {
+		if !slices.Equal(srcUser.Roles, tgtUser.Roles) {
 			errors = append(errors,
 				fmt.Sprintf("⚠️  User [%s] has different roles\n     src=%v\n     tgt=%v",
-					username, srcRoles, tgtRoles))
+					username, srcUser.Roles, tgtUser.Roles))
+		}
+		// Per-user auth mechanism (e.g. SCRAM vs x.509 on the same username
+		// with identical roles) - distinct from the server-wide enabled
+		// mechanism list checked below, and confirmed not version-driven
+		// (a fresh user gets the same default mechanism set on 4.4 through
+		// 8.0) - a mismatch here means deliberate config drift, not a
+		// version artifact, so this is a blocking check.
+		if !slices.Equal(srcUser.Mechanisms, tgtUser.Mechanisms) {
+			errors = append(errors,
+				fmt.Sprintf("⚠️  User [%s] has different auth mechanisms\n     src=%v\n     tgt=%v",
+					username, srcUser.Mechanisms, tgtUser.Mechanisms))
 		}
 	}
 	for username := range tgtUsers {
@@ -89,13 +100,20 @@ func VerifyAuth(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report)
 	printStatus("Account permissions", res.Passed, fmt.Sprintf("%d users", len(srcUsers)))
 }
 
-func getUsers(ctx context.Context, client *mongo.Client) (map[string][]string, error) {
+// userInfo holds one user's role list and auth mechanism list, both
+// sorted for stable equality comparison.
+type userInfo struct {
+	Roles      []string
+	Mechanisms []string
+}
+
+func getUsers(ctx context.Context, client *mongo.Client) (map[string]userInfo, error) {
 	result := client.Database("admin").RunCommand(ctx, bson.D{{Key: "usersInfo", Value: 1}})
 	var res bson.M
 	if err := result.Decode(&res); err != nil {
 		return nil, err
 	}
-	users := make(map[string][]string)
+	users := make(map[string]userInfo)
 	arr, _ := res["users"].(bson.A)
 	for _, u := range arr {
 		um, _ := u.(bson.M)
@@ -106,7 +124,14 @@ func getUsers(ctx context.Context, client *mongo.Client) (map[string][]string, e
 			roles = append(roles, fmt.Sprintf("%s@%s", rm["role"], rm["db"]))
 		}
 		sort.Strings(roles)
-		users[username] = roles
+		var mechs []string
+		if marr, ok := um["mechanisms"].(bson.A); ok {
+			for _, m := range marr {
+				mechs = append(mechs, fmt.Sprintf("%v", m))
+			}
+			sort.Strings(mechs)
+		}
+		users[username] = userInfo{Roles: roles, Mechanisms: mechs}
 	}
 	return users, nil
 }

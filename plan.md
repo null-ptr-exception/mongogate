@@ -1,5 +1,11 @@
 # Plan: cross-version source/target testing
 
+**Status: executed.** Everything proposed below was carried out for real
+against a kind cluster, and then widened to a full 4.4/5.0/6.0/7.0 → 8.0
+matrix (this plan only proposed one pair). See `docs/TESTING.md` sections
+8-11 for the actual results, evidence, and fixes - this file is kept as
+the original pre-execution proposal, not updated to match.
+
 ## Context
 
 Every E2E pass so far ran source and target on the **same** MongoDB version
