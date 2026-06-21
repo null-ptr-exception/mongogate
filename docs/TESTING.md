@@ -68,6 +68,7 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 17 | New data formats on MongoDB 8.0 (vector embeddings, time series, clustered collection, collation, hidden index, real geo data, large documents) | ✅ Mostly clean on the first try; found a real structural limitation (time series bucket `_id`) and a real performance characteristic (large-document memory multiplier) — see section 7 |
 | 18 | Cross-version source/target (4.4 → 8.0) | ⚠️ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections — fixed (`compareBSONFields` asymmetric skip, `_id_` index skip), re-verified live; plus 3 confirmed-but-not-yet-fixed blind spots (server params, per-user auth mechanism, default RW concern) — see section 8 |
 | 19 | Deeper code review + first-ever real Phase 3 run | ⚠️ Found and fixed 4 more gaps (GridFS content check was dead code, checkpoint file was global not job-scoped, role inheritance never compared, replica topology never compared) plus a regression those fixes would have hit (admin/GridFS-internal collections guarantee false positives under generic comparison) and its proper replacement (dedicated FCV/version info, non-blocking) — see section 9 |
+| 20 | Full version matrix: 4.4/5.0/6.0/7.0 each vs 8.0 | ⚠️ Found a setup-script bug that would have broken on 6.0/7.0 (no legacy `mongo` shell at all), fixed and now auto-detects; found a third instance of the GridFS false-positive pattern in time series bucket internals (fixed); precisely bounded the `clustered_col` gap (4.4/5.0 only) and the time series bucket-format gap (5.0/6.0 only) — 7.0→8.0 is the only pair with zero structural findings — see section 10 |
 
 ### Bugs found and fixed during this pass
 
@@ -795,6 +796,96 @@ clean except the two genuine `timeseries_col`/`clustered_col` failures -
 zero false positives, GridFS content hash confirmed passing on identical
 content, version line confirmed printing `Source: version=4.4.30 fcv=4.4`
 / `Target: version=8.0.26 fcv=8.0`.
+
+---
+
+## 10. The full version matrix: 4.4 / 5.0 / 6.0 / 7.0, each against an 8.0 target
+
+Section 8 only tested one pair (4.4 → 8.0). A reasonable follow-up
+question: does every source version exhibit the same gaps, or does it vary
+by exactly how far apart the two versions are? Tested for real -
+`mongo:5.0`, `6.0`, and `7.0` each as source, same 8.0 target, same seeded
+baseline, same kind cluster (source namespace torn down and redeployed
+with a different image tag between runs; target/monitor/tools left
+running throughout).
+
+**A real setup bug found and fixed before any of this could run**:
+`setup.sh`'s shell selection from section 8 (`mongo` for source, `mongosh`
+for target) only happened to work for the one pair already tested -
+`mongo:6.0` and `7.0` images ship **only** `mongosh`, no legacy `mongo` at
+all, so the hardcoded assumption would have failed outright. Fixed by
+detecting which binary actually exists in the running container
+(`which mongosh`) rather than assuming by namespace, and made the
+StatefulSet readiness/liveness probes try `mongosh` first with a
+fallback to `mongo` so the same YAML works unmodified across every tested
+version. Confirmed live: `mongo:4.4` → only `mongo`; `5.0` → both;
+`6.0`/`7.0` → only `mongosh`.
+
+### Result matrix
+
+| Source | FCV vs 8.0 | `clustered_col` | `timeseries_col` itself | `system.buckets.*` validator | `meta_1_ts_1` index | Phase 1 result | Phase 3 data |
+|---|---|---|---|---|---|---|---|
+| 4.4 | differs (4.4 vs 8.0) | ❌ plain collection (no `clusteredIndex` support pre-5.3) | ❌ plain collection (no time series support pre-5.0) | n/a (bucket doesn't exist) | n/a | **FAIL** | clean |
+| 5.0 | differs (5.0 vs 8.0) | ❌ plain collection (still pre-5.3) | ✅ real time series | ❌ differs (target requires a `count` field 5.0's validator doesn't) | ❌ missing on source | **FAIL** | clean |
+| 6.0 | differs (6.0 vs 8.0) | ✅ matches (5.3+ covers it) | ✅ real time series | ✅ matches | ❌ still missing on source | **FAIL** (only the index) | clean |
+| 7.0 | differs (7.0 vs 8.0) | ✅ matches | ✅ real time series | ✅ matches | ✅ matches | **✅ PASS, exit 0** | clean |
+
+"Phase 3 data: clean" means zero false positives across every run, after
+the fixes in section 9.5 (`admin` and GridFS-internal collections
+excluded) plus one more found in *this* pass (next subsection).
+
+### A third instance of the same false-positive pattern: time series bucket internals
+
+Running `system.buckets.timeseries_col` through the generic Phase 3 data
+verifier on the 5.0 pair produced `missing=1 extra_in_target=1` even
+though the logical `timeseries_col` collection (the one a user actually
+queries) was already confirmed identical. Pulled the raw bucket documents
+directly to see why:
+
+```
+source (5.0): {"_id":"6955b90063c1945e2433c0bf","control":{"version":1,...},
+               "data":{"value":{"0":1.5,"1":2.5},"_id":{"0":"ts-0","1":"ts-1"},...}}
+target (8.0): {"_id":"6955b9002762d33c60908f49","control":{"version":2,...,"count":2},
+               "data":{"value":"AQAAAAAAAAD4P6BOAQAAAAAAAAA=", ...}}
+```
+
+Two independent problems, same root cause as the GridFS chunk-ID issue in
+9.5: the bucket `_id` is a fresh ObjectID minted independently per side
+(non-deterministic across independently-seeded sides, regardless of
+correctness), and `control.version` (1 = row-based pre-7.0 encoding, 2 =
+columnar 7.0+ encoding - a real, documented MongoDB storage format change)
+means the *same logical measurements* are encoded completely differently
+at the storage level depending on source version. Comparing this directly
+guarantees a false positive across any version gap that changed bucket
+encoding, on top of being redundant - the logical view is already verified
+correctly through the normal collection-level path.
+
+**Fixed**: `system.buckets.<name>` collections excluded from the Phase 2/3
+data verification list (`cmd/mongogate/main.go`, `isTimeSeriesBucket`),
+same treatment as the GridFS exclusion. Structural checks (existence,
+options, indexes) still run normally on them, since those *are*
+deterministic per version and are exactly what surfaced the
+`meta_1_ts_1`/validator findings above - only the raw per-document content
+comparison is excluded.
+
+### What this narrows down, precisely
+
+- Built-in role privilege differences (plan.md risk #1) and
+  `2dsphereIndexVersion`/general index-version differences (risk #2) did
+  not fire on **any** of the four pairs in this matrix - both remain
+  theoretical for now, not confirmed on a real cluster.
+- The `clustered_col` gap is bounded exactly: broken on 4.4 and 5.0
+  (clustered collections need 5.3+), fine from 6.0 onward.
+- The time series bucket gap is bounded exactly: the bucket validator
+  format changed somewhere between 5.0 and 6.0; the automatic
+  `meta_1_ts_1` index was introduced somewhere between 6.0 and 7.0. Not
+  narrowed further than that - 5.1-5.3 and 6.1-6.x point releases weren't
+  tested.
+- **7.0 → 8.0 is the only pair in this matrix with zero structural
+  findings** - every check passes, exit code 0. The widest tested gap
+  (4.4 → 8.0) is also the one with the most findings; this is consistent
+  with "more findings the wider the version gap," but four data points
+  isn't enough to call that a confirmed trend, just an observation.
 
 ---
 

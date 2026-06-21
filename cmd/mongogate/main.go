@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
@@ -150,6 +151,21 @@ func main() {
 				// sides even when the actual file content is identical.
 				continue
 			}
+			if isTimeSeriesBucket(col) {
+				// system.buckets.<name> is time series' internal storage,
+				// not user data - confirmed live across a 5.0->8.0 pair:
+				// the bucket _id is a fresh ObjectID per side (same
+				// non-determinism as GridFS chunks), and the bucket
+				// encoding itself differs by server version
+				// (control.version 1 = row-based, pre-7.0; 2 = columnar,
+				// 7.0+) even when the logical measurements are identical.
+				// The logical view (the timeseries_col collection itself)
+				// is already verified correctly through the normal path -
+				// comparing the internal bucket on top of that is
+				// redundant and guarantees a false positive across any
+				// version gap that changed bucket encoding.
+				continue
+			}
 			collections = append(collections, verifier.CollectionTask{DBName: db, ColName: col})
 		}
 	}
@@ -264,6 +280,13 @@ func promptContinue(msg string) {
 // out of scope for this check, since nothing in this codebase uses one.
 func isGridFSInternal(colName string) bool {
 	return colName == "fs.files" || colName == "fs.chunks"
+}
+
+// isTimeSeriesBucket matches MongoDB's fixed internal naming convention for
+// a time series collection's backing storage (system.buckets.<name>),
+// regardless of what the time series collection itself is named.
+func isTimeSeriesBucket(colName string) bool {
+	return strings.HasPrefix(colName, "system.buckets.")
 }
 
 func toHashOptions(h config.HashOptions) utils.HashOptions {

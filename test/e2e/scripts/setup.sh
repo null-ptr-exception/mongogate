@@ -22,10 +22,6 @@ kubectl apply -f "$KIND_DIR/namespaces.yaml"
 
 setup_replica_set() {
   local ns="$1"
-  # mongo:4.4 images only bundle the legacy `mongo` shell, not `mongosh`
-  # (added starting around the 6.0 image line) - cross-version test pass.
-  local shell="mongosh"
-  [ "$ns" = mongo-source ] && shell="mongo"
   echo "==> [$ns] Generating keyfile secret..."
   if ! kubectl -n "$ns" get secret mongo-keyfile >/dev/null 2>&1; then
     openssl rand -base64 756 > /tmp/mongo-keyfile-$ns
@@ -39,6 +35,17 @@ setup_replica_set() {
 
   echo "==> [$ns] Waiting for all 3 replicas to be ready..."
   kubectl -n "$ns" wait --for=jsonpath='{.status.readyReplicas}'=3 statefulset/mongo --timeout=240s
+
+  # Detect the shell binary actually present in this image rather than
+  # assuming by namespace: mongo:4.4 ships only the legacy `mongo` shell,
+  # mongo:6.0+ ships only `mongosh`, and mongo:5.0 ships both - so which
+  # namespace has which depends entirely on which image tag is currently
+  # set in that namespace's statefulset.yaml, not on source-vs-target.
+  local shell="mongosh"
+  if ! kubectl -n "$ns" exec mongo-0 -- which mongosh >/dev/null 2>&1; then
+    shell="mongo"
+  fi
+  echo "    [$ns] using shell: $shell"
 
   echo "==> [$ns] Initiating replica set..."
   # Both the throw-on-error path (mongosh) and the return-ok:0 path (legacy
@@ -103,6 +110,6 @@ kubectl apply -f "$KIND_DIR/monitor/deployment.yaml"
 kubectl -n mongogate-test wait --for=condition=Ready pod -l app=monitor-mongo --timeout=120s
 
 echo "==> Environment is up."
-echo "    Source: kubectl -n mongo-source exec mongo-0 -- mongo"
-echo "    Target: kubectl -n mongo-target exec mongo-0 -- mongosh"
+echo "    Source: kubectl -n mongo-source exec mongo-0 -- mongosh (or mongo, depending on image)"
+echo "    Target: kubectl -n mongo-target exec mongo-0 -- mongosh (or mongo, depending on image)"
 echo "    Monitor: kubectl -n mongogate-test exec deploy/monitor-mongo -- mongosh"

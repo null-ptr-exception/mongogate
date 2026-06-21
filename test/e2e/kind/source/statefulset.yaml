@@ -70,14 +70,17 @@ spec:
             - containerPort: 27017
               name: mongod
           readinessProbe:
+            # mongosh-only on 6.0+, legacy mongo-only on 4.4, both on 5.0 -
+            # try mongosh first, fall back to mongo, so this StatefulSet
+            # works unmodified regardless of which image tag is set above.
             exec:
-              command: ["mongo", "--quiet", "--eval", "db.runCommand('ping')"]
+              command: ["sh", "-c", "mongosh --quiet --eval \"db.runCommand('ping')\" || mongo --quiet --eval \"db.runCommand('ping')\""]
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 10
           livenessProbe:
             exec:
-              command: ["mongo", "--quiet", "--eval", "db.runCommand('ping')"]
+              command: ["sh", "-c", "mongosh --quiet --eval \"db.runCommand('ping')\" || mongo --quiet --eval \"db.runCommand('ping')\""]
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 10
