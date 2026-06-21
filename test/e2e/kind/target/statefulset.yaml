@@ -45,7 +45,9 @@ spec:
     spec:
       initContainers:
         - name: copy-keyfile
-          image: mongo:8.0
+          # Just cp+chmod - no MongoDB needed, so this stays pinned and
+          # version-independent rather than mongo:X.Y.
+          image: busybox:1.36
           command:
             - sh
             - -c

@@ -72,6 +72,7 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 21 | Closing the 3 remaining blind spots from section 8.4 | ✅ Per-user auth mechanism and server-parameter coverage (2→5 params) fixed as blocking checks, confirmed live; default read/write concern fixed as informational (non-blocking by design, since it's version-driven) — see section 11 |
 | 22 | Cross-version testing in CI, not just by hand | ✅ Added `.github/workflows/e2e.yml`: same-version happy path + injected-drift detection, and the full 4.4/5.0/6.0/7.0 vs 8.0 matrix asserting the exact documented boundaries — confirmed passing on real GitHub Actions, not just locally — see section 12 |
 | 23 | Source/target version now a variable, not a hand-edited file | ✅ `setup.sh` takes `SOURCE_MONGO_VERSION`/`TARGET_MONGO_VERSION` env vars, substituted on the fly into `kubectl apply -f -` - confirmed `git diff` shows zero changes to the checked-in YAML after switching versions — see section 10 |
+| 24 | Structured multi-angle code review of the full branch diff | ✅ Found and fixed 2 real bugs (GridFS content-hash read had no timeout - could hang Phase 3 forever; target-side user/role fetch errors were silently swallowed in `VerifyAuth`, masking connectivity failures as "all users missing") plus 2 minor ones (setup.sh's sed could rewrite the wrong image line; a stale doc example) - see section 13 |
 
 ### Bugs found and fixed during this pass
 
@@ -1010,6 +1011,94 @@ to select the version, never editing the checked-in YAML.
 including all four matrix entries, alongside the pre-existing
 `go build`/`vet`/`test`/`golangci-lint` job. Runtime: ~3-4 minutes per
 job, all five running in parallel.
+
+---
+
+## 13. Structured code review of this entire branch's diff
+
+Ran a full multi-angle code review (correctness, removed-behavior audit,
+cross-file call-site tracing, reuse, simplification, efficiency, altitude,
+conventions) against `git diff main...HEAD` (~3,400 lines across 33
+files) rather than relying on having already read every line carefully
+during development. Two real, confirmed bugs found and fixed; the rest
+were either already-disclosed tradeoffs or non-issues, confirmed by
+direct verification rather than taken on faith.
+
+### Fixed
+
+1. **GridFS content-hash read had no timeout** (`gridfs_verifier.go`).
+   `gridFSContentHash` discarded its `context.Context` parameter, and
+   neither `bucket.OpenDownloadStream` nor `io.Copy` have a timeout of
+   their own in this driver version - a network blip or stuck connection
+   during Phase 3 would hang that worker goroutine (and `VerifyAllData`'s
+   `wg.Wait()`) forever, with no way to recover short of killing the
+   process. Fixed with `bucket.SetReadDeadline(time.Now().Add(60 *
+   time.Second))` before opening the stream. Re-verified live: Phase 3
+   GridFS check still passes and completes well within the new bound.
+2. **Target-side (and role) fetch errors were silently swallowed in
+   `VerifyAuth`** (`auth_verifier.go`). `tgtUsers, _ := getUsers(ctx,
+   tgt)` discarded the error - if `usersInfo` failed on target for any
+   reason (permissions, transient network issue), every real source user
+   would be reported as `❌ Missing user`, masking a connectivity problem
+   as a complete user-migration failure. Same pattern existed for
+   `getRoles`. Fixed: both errors are now surfaced, and the comparison
+   loop is skipped entirely on a fetch failure (ranging over a nil map in
+   Go is a no-op) rather than comparing against an incomplete map.
+   Re-verified live: normal seeded baseline still passes cleanly
+   (`✅ PASS Account permissions`); a connection-level auth failure (bad
+   target credentials) is already caught earlier and more clearly by
+   `mustConnect` at startup, confirmed by direct test.
+
+### Also fixed, lower severity
+
+3. **`setup.sh`'s version substitution could have rewritten the wrong
+   `image:` line.** The `copy-keyfile` initContainer in both
+   StatefulSets used `image: mongo:8.0` even though it only runs
+   `cp`/`chmod` and needs no MongoDB at all - `sed`'s `s|image:
+   mongo:...|...|g` would match that line too, not just the `mongod`
+   container's, harmlessly today but fragile. Switched both
+   initContainers to `busybox:1.36`, which can't be matched by the
+   mongo-version substitution at all - not just patched, the ambiguity
+   is now structurally impossible.
+4. **`docs/PLAN.md`'s example config still listed `encryption: false`**,
+   the flag removed in section 9. Commented out with a pointer to why.
+
+### Checked and confirmed not an issue (most disputed candidate)
+
+The per-user `Mechanisms` comparison (`slices.Equal(srcUser.Mechanisms,
+tgtUser.Mechanisms)`) was flagged by one review angle as risky if a user
+type without a `mechanisms` field (e.g. x.509) decodes to `nil` and gets
+compared against a populated SCRAM mechanism list. Verified this is
+actually the *intended* detection, not a bug: `slices.Equal(nil, nil)` is
+`true` (two mechanism-less users compare equal, correctly), while `nil`
+vs. a populated list is `false` (an x.509 user vs. a SCRAM user of the
+same name with the same roles - exactly the deliberate-config-drift case
+this check exists to catch). No change made.
+
+### Disclosed tradeoffs, not hidden bugs (already documented elsewhere, re-confirmed here)
+
+A few review angles independently converged on the same three observations - all real, all already written down (in this file or in code comments) rather than discovered for the first time here:
+
+- `isGridFSInternal`/`isTimeSeriesBucket` (`cmd/mongogate/main.go`) only
+  filter the Phase 2/3 raw-document comparison, not `VerifyCollections`/
+  `VerifyIndexes`'s structural checks - **deliberate**, since the
+  structural checks on `system.buckets.*` are exactly what surfaced the
+  `meta_1_ts_1`/validator findings in section 10. `fs.files`/`fs.chunks`
+  going through that same unfiltered structural path was never
+  specifically exercised by the test matrix (only `VerifyGridFS`'s
+  dedicated check was), but GridFS's default indexes/options are created
+  identically by the driver regardless of server version, so this is
+  low-risk in practice, not a known-broken path.
+- `admin` is excluded wholesale via `skip_dbs` rather than excluding only
+  `system.*` collections within it - coarser than the GridFS/timeseries
+  fix, and would silently skip any non-`system.*` collection a user
+  legitimately stores in `admin` (legal in MongoDB, unusual in practice).
+  A future, more targeted fix is possible; not attempted here because it
+  wasn't the problem this pass needed to solve.
+- The server-parameter list grew from 2 to 5 hardcoded names rather than
+  a denylist-based wildcard comparison - already explicitly flagged as
+  "deliberately not done" in section 11, re-confirmed here as the same
+  known gap, not a new one.
 
 ---
 

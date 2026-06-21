@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -13,6 +14,14 @@ import (
 
 	"github.com/null-ptr-exception/mongogate/internal/report"
 )
+
+// gridFSReadTimeout bounds a single file's content-hash read. Without it, a
+// network blip or stuck connection during io.Copy hangs that worker
+// goroutine (and VerifyAllData's wg.Wait()) forever, since neither
+// OpenDownloadStream nor io.Copy have a timeout of their own in this driver
+// version - confirmed by reading both, no context parameter reaches the
+// actual socket read.
+const gridFSReadTimeout = 60 * time.Second
 
 func VerifyGridFS(ctx context.Context, src, tgt *mongo.Client,
 	dbName string, fullVerify bool, rpt *report.Report) {
@@ -83,6 +92,9 @@ func VerifyGridFS(ctx context.Context, src, tgt *mongo.Client,
 func gridFSContentHash(_ context.Context, client *mongo.Client, dbName string, fileID interface{}) (string, error) {
 	bucket, err := gridfs.NewBucket(client.Database(dbName))
 	if err != nil {
+		return "", err
+	}
+	if err := bucket.SetReadDeadline(time.Now().Add(gridFSReadTimeout)); err != nil {
 		return "", err
 	}
 	stream, err := bucket.OpenDownloadStream(fileID)

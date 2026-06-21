@@ -268,7 +268,8 @@ verify:
   data: true
   gridfs: true
   sharding: false
-  encryption: false
+  # encryption: false - removed; see docs/TESTING.md Known limitations,
+  # this was a dead flag and copying it into a real config now does nothing
 
 phase2_lag_threshold_seconds: 10
 sample_rate: 0.1

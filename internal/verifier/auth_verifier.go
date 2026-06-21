@@ -18,12 +18,22 @@ func VerifyAuth(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report)
 	var errors []string
 
 	// ── Users ──
-	srcUsers, err := getUsers(ctx, src)
-	if err != nil {
-		errors = append(errors, fmt.Sprintf("failed to get source users: %v", err))
+	// A fetch failure on either side must not fall through to the
+	// comparison loop below: an empty/nil map from a swallowed error looks
+	// identical to "this side genuinely has no users," which would report
+	// every real user as "❌ Missing" - masking a connectivity/permissions
+	// problem as a complete user-migration failure.
+	srcUsers, srcErr := getUsers(ctx, src)
+	tgtUsers, tgtErr := getUsers(ctx, tgt)
+	if srcErr != nil {
+		errors = append(errors, fmt.Sprintf("failed to get source users: %v", srcErr))
 	}
-	tgtUsers, _ := getUsers(ctx, tgt)
-
+	if tgtErr != nil {
+		errors = append(errors, fmt.Sprintf("failed to get target users: %v", tgtErr))
+	}
+	if srcErr != nil || tgtErr != nil {
+		srcUsers, tgtUsers = nil, nil
+	}
 	for username, srcUser := range srcUsers {
 		tgtUser, ok := tgtUsers[username]
 		if !ok {
@@ -54,8 +64,18 @@ func VerifyAuth(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report)
 	}
 
 	// ── Custom Roles (name + actual privilege content + inherited roles, not just existence) ──
-	srcRoles, _ := getRoles(ctx, src)
-	tgtRoles, _ := getRoles(ctx, tgt)
+	// Same reasoning as Users above: don't compare past a fetch failure.
+	srcRoles, srcRoleErr := getRoles(ctx, src)
+	tgtRoles, tgtRoleErr := getRoles(ctx, tgt)
+	if srcRoleErr != nil {
+		errors = append(errors, fmt.Sprintf("failed to get source roles: %v", srcRoleErr))
+	}
+	if tgtRoleErr != nil {
+		errors = append(errors, fmt.Sprintf("failed to get target roles: %v", tgtRoleErr))
+	}
+	if srcRoleErr != nil || tgtRoleErr != nil {
+		srcRoles, tgtRoles = nil, nil
+	}
 	for role, srcInfo := range srcRoles {
 		tgtInfo, ok := tgtRoles[role]
 		if !ok {
