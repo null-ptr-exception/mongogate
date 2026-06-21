@@ -19,8 +19,10 @@ func VerifyIndexes(ctx context.Context, src, tgt *mongo.Client,
 
 	var errors []string
 
+	// _id_ is no longer skipped: a clustered collection's defining
+	// characteristic (unique/clustered flags) lives only on this index, so
+	// skipping it by name silently passed plain-vs-clustered mismatches.
 	for name, si := range srcIdxs {
-		if name == "_id_" { continue }
 		ti, ok := tgtIdxs[name]
 		if !ok {
 			errors = append(errors, fmt.Sprintf("❌ Missing index: %s", name))
@@ -29,7 +31,6 @@ func VerifyIndexes(ctx context.Context, src, tgt *mongo.Client,
 		errors = append(errors, compareIndex(name, si, ti)...)
 	}
 	for name := range tgtIdxs {
-		if name == "_id_" { continue }
 		if _, ok := srcIdxs[name]; !ok {
 			errors = append(errors, fmt.Sprintf("⚠️  Extra index in target: %s", name))
 		}
@@ -48,6 +49,7 @@ func compareIndex(name string, si, ti bson.M) []string {
 	fields := []string{
 		"key",
 		"unique",
+		"clustered",
 		"sparse",
 		"hidden",
 		"expireAfterSeconds",    // TTL

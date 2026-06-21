@@ -66,7 +66,7 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 15 | CLI/config matrix | ✅ `--dry-run`, `--exclude-ns "db.*"`, multi-entry `include_ns`/`exclude_ns`, combined include+exclude, bad-config validation all correct |
 | 16 | Comparison-logic bugs (UTF-8 truncation, negative zero, role privileges, array-of-docs recursion) | ✅ All 4 confirmed real, fixed, unit- and E2E-tested — see section 6 |
 | 17 | New data formats on MongoDB 8.0 (vector embeddings, time series, clustered collection, collation, hidden index, real geo data, large documents) | ✅ Mostly clean on the first try; found a real structural limitation (time series bucket `_id`) and a real performance characteristic (large-document memory multiplier) — see section 7 |
-| 18 | Cross-version source/target (4.4 → 8.0) | ❌ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a confirmed bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections mongogate barely detects; plus 4 confirmed blind spots (server params, per-user auth mechanism, default RW concern, FCV) — see section 8 |
+| 18 | Cross-version source/target (4.4 → 8.0) | ⚠️ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections — fixed (`compareBSONFields` asymmetric skip, `_id_` index skip), re-verified live; plus 4 confirmed-but-not-yet-fixed blind spots (server params, per-user auth mechanism, default RW concern, FCV) — see section 8 |
 
 ### Bugs found and fixed during this pass
 
@@ -560,26 +560,53 @@ kind of collection. This is strictly worse for a real migration than a
 missing-collection error would be: nothing about the name or existence check
 flags it.
 
-mongogate misses this almost completely:
-- `verifyCollectionOptions` compares the `timeseries`/`clusteredIndex` option
+mongogate missed this almost completely, for two independent reasons - both
+fixed this pass, not left as known limitations:
+
+- `verifyCollectionOptions` compared the `timeseries`/`clusteredIndex` option
   keys via `compareBSONFields` (`schema_verifier.go:101-109`), which
-  explicitly **skips any field the source side doesn't have**
-  (`types.go:24`: `sv != "<nil>"`) — and a plain collection's options simply
-  doesn't have those keys, so the skip swallows the entire diff at the
-  options level for both collections.
-- For `clustered_col` specifically, there is **no signal at all** — Phase 1
-  reported it `✅ PASS`. `VerifyIndexes` (`index_verifier.go:22,31`)
-  unconditionally skips the `_id_` index by name on both sides
-  (`if name == "_id_" { continue }`), and a clustered collection's defining
-  characteristic (`unique`/`clustered` on that exact index) lives nowhere
-  else to compare.
-- For `timeseries_col`, the only signals that leak through are indirect and
-  easy to misread: the internal `system.buckets.timeseries_col` storage
-  collection shows up as an "extra collection in target" (not "timeseries_col
-  itself differs"), and the auto-created metadata index `meta_1_ts_1` shows
-  up as an "extra index." A human reading the report would have to already
-  know to connect those two artifacts back to "the collection type itself is
-  wrong" — nothing says that directly.
+  explicitly **skipped any field the source side didn't have**
+  (`types.go:24`, old code: `sv != "<nil>"`) — and a plain collection's
+  options simply doesn't have those keys, so the skip swallowed the entire
+  diff at the options level for both collections. The "skip" was meant to
+  mean "doesn't apply to either side" (already covered for free since
+  `sv == tv` when both are absent) but was actually written as "skip
+  whenever source lacks it," which also swallows the asymmetric case where
+  *only one side* has the field - exactly the case that matters here, and
+  the same bug pattern affecting every other field compared this way
+  (`capped`/`size`/`max`, index `sparse`/`hidden`/`wildcardProjection`, etc).
+  **Fixed**: removed the `sv != "<nil>"` condition in `compareBSONFields`
+  (`types.go`) entirely, leaving just `sv != tv`.
+- For `clustered_col` specifically, there was **no signal at all** - Phase 1
+  reported it `✅ PASS`. `VerifyIndexes` (`index_verifier.go`) unconditionally
+  skipped the `_id_` index by name on both sides, and a clustered
+  collection's defining characteristic (`unique`/`clustered` on that exact
+  index) lives nowhere else to compare. **Fixed**: removed the `_id_` skip
+  in both loops, and added `clustered` to `compareIndex`'s field list
+  alongside the already-present `unique`.
+
+Re-verified live against the same 4.4/8.0 pair after both fixes
+(`go build && go vet && go test ./... && golangci-lint run` all clean
+first):
+
+```
+❌ Index [migtest.clustered_col]
+   ⚠️  Index [_id_].unique: src=<nil> tgt=true
+   ⚠️  Index [_id_].clustered: src=<nil> tgt=true
+❌ Index [migtest.timeseries_col]
+   ❌ Missing index: _id_
+   ⚠️  Extra index in target: meta_1_ts_1
+
+migtest.*: ❌ FAIL
+⚠️  [migtest.clustered_col].clusteredIndex: src=<nil> tgt=map[key:map[_id:1] name:_id_ unique:true v:2]
+⚠️  [migtest.timeseries_col].timeseries: src=<nil> tgt=map[bucketMaxSpanSeconds:3600 granularity:seconds metaField:meta timeField:ts]
+⚠️  Extra collection: migtest.system.buckets.timeseries_col
+```
+
+Both collections now fail clearly and directly (the collection-options diff
+names the exact field, `clusteredIndex`/`timeseries`, instead of relying on
+indirect artifacts), and every other previously-passing collection/index in
+the same run is still `✅ PASS` - no new false positives introduced.
 
 ### 4. The three other blind spots from this session, confirmed live
 
@@ -651,18 +678,20 @@ write-ups below just to know which is which:
 | 2 | Deprecated BSON types | Cosmetic only | **Yes, trivially** — comparison/diff detection already works; only the displayed type name is ugly |
 | 3 | Vector/Atlas Search index definitions | Structural blind spot | **No, not with this approach** — `VerifyIndexes` calls `listIndexes`, which cannot see mongot's catalog at all; would need an entirely different mechanism (talking to mongot/Atlas Search APIs directly) |
 | 4 | Queryable Encryption | Fundamental ceiling | **No, never** — impossible by the design of encryption itself; no amount of engineering on this tool fixes it without the encryption keys |
-| 5 | Collection options / index options use a fixed field allowlist | Confirmed blind spot (section 8.3) | **Yes** — `compareBSONFields` (`types.go:19-29`) only compares a hardcoded field list and skips anything the source side doesn't have; confirmed it silently misses a 4.4 collection masquerading as `timeseries`/`clusteredIndex` on the target. Fixing means inverting the allowlist to a denylist (compare the full raw doc, exclude only known-legitimate-to-differ fields), not yet done. |
-| 6 | `_id_` index unconditionally skipped | Confirmed blind spot (section 8.3) | **Yes** — `VerifyIndexes` (`index_verifier.go:22,31`) skips `_id_` by name on both sides unconditionally; this is the only index a clustered collection has, so clustered-vs-plain divergence on `_id_` (`unique`/`clustered` flags) produces zero signal at all. |
-| 7 | Cluster server parameters checked = 2 of hundreds | Confirmed blind spot (section 8.4) | **Yes** — `cluster_verifier.go:33` hardcodes exactly `slowOpThresholdMs`/`maxIncomingConnections`; confirmed a third (`notablescan`) set differently produces no diff. |
-| 8 | Per-user auth mechanism never checked | Confirmed blind spot (section 8.4) | **Yes** — `getUsers` (`auth_verifier.go:87-107`) only reads `user`/`roles`, never `mechanisms`; confirmed same user/roles with different `mechanisms` on each side reports as matching. |
-| 9 | Cluster-wide default read/write concern never checked | Confirmed blind spot (section 8.4) | **Yes** — no code anywhere calls `getDefaultRWConcern`; confirmed a real, version-driven durability-semantics difference (4.4 vs 8.0 implicit write concern) produces no diff. |
-| 10 | FCV never read or compared | Confirmed blind spot (section 8.5) | **Yes** — cheap addition (`getParameter: featureCompatibilityVersion`), informational line in the Phase 1 report would cover it; not yet implemented. |
+| 5 | Cluster server parameters checked = 2 of hundreds | Confirmed blind spot (section 8.4) | **Yes** — `cluster_verifier.go:33` hardcodes exactly `slowOpThresholdMs`/`maxIncomingConnections`; confirmed a third (`notablescan`) set differently produces no diff. |
+| 6 | Per-user auth mechanism never checked | Confirmed blind spot (section 8.4) | **Yes** — `getUsers` (`auth_verifier.go:87-107`) only reads `user`/`roles`, never `mechanisms`; confirmed same user/roles with different `mechanisms` on each side reports as matching. |
+| 7 | Cluster-wide default read/write concern never checked | Confirmed blind spot (section 8.4) | **Yes** — no code anywhere calls `getDefaultRWConcern`; confirmed a real, version-driven durability-semantics difference (4.4 vs 8.0 implicit write concern) produces no diff. |
+| 8 | FCV never read or compared | Confirmed blind spot (section 8.5) | **Yes** — cheap addition (`getParameter: featureCompatibilityVersion`), informational line in the Phase 1 report would cover it; not yet implemented. |
 
 Items 3 and 4 are the two that are genuinely "cannot verify," not just
 "didn't get to it" — worth reading in full if evaluating whether to rely on
-this tool for a migration that uses either feature. Items 5-10 were all
-found and confirmed live in section 8 (cross-version testing) — all fixable,
-none fixed yet; see that section for the evidence behind each.
+this tool for a migration that uses either feature. Items 5-8 were found and
+confirmed live in section 8 (cross-version testing) — all fixable, none
+fixed yet; see that section for the evidence behind each. Two related and
+more severe blind spots found in the same pass (collection/index options
+using a fixed field allowlist that skipped asymmetric diffs, and the `_id_`
+index being unconditionally skipped) were fixed immediately rather than
+listed here - see section 8.3.
 
 1. **Sharded clusters** (mongos + config servers) were never tested — every
    scenario in this document ran against replica sets. `verify.sharding`
