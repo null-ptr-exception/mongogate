@@ -58,7 +58,7 @@ spec:
               mountPath: /etc/mongo-keyfile
       containers:
         - name: mongod
-          image: mongo:8.0
+          image: mongo:4.4
           command:
             - mongod
             - --replSet=rs0
@@ -71,13 +71,13 @@ spec:
               name: mongod
           readinessProbe:
             exec:
-              command: ["mongosh", "--quiet", "--eval", "db.runCommand('ping')"]
+              command: ["mongo", "--quiet", "--eval", "db.runCommand('ping')"]
             initialDelaySeconds: 5
             periodSeconds: 5
             timeoutSeconds: 10
           livenessProbe:
             exec:
-              command: ["mongosh", "--quiet", "--eval", "db.runCommand('ping')"]
+              command: ["mongo", "--quiet", "--eval", "db.runCommand('ping')"]
             initialDelaySeconds: 15
             periodSeconds: 15
             timeoutSeconds: 10

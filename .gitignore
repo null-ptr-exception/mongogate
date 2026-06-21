@@ -1,4 +1,4 @@
-mongogate
+/mongogate
 checkpoints.json
 verify_report_*.json
 diff_*.csv

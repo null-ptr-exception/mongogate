@@ -66,6 +66,7 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 15 | CLI/config matrix | ✅ `--dry-run`, `--exclude-ns "db.*"`, multi-entry `include_ns`/`exclude_ns`, combined include+exclude, bad-config validation all correct |
 | 16 | Comparison-logic bugs (UTF-8 truncation, negative zero, role privileges, array-of-docs recursion) | ✅ All 4 confirmed real, fixed, unit- and E2E-tested — see section 6 |
 | 17 | New data formats on MongoDB 8.0 (vector embeddings, time series, clustered collection, collation, hidden index, real geo data, large documents) | ✅ Mostly clean on the first try; found a real structural limitation (time series bucket `_id`) and a real performance characteristic (large-document memory multiplier) — see section 7 |
+| 18 | Cross-version source/target (4.4 → 8.0) | ❌ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a confirmed bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections mongogate barely detects; plus 4 confirmed blind spots (server params, per-user auth mechanism, default RW concern, FCV) — see section 8 |
 
 ### Bugs found and fixed during this pass
 
@@ -449,6 +450,195 @@ ceiling is universal.
 
 ---
 
+## 8. Cross-version source/target testing (MongoDB 4.4 → 8.0)
+
+Every pass above ran source and target on the *same* MongoDB version. Real
+migrations exist specifically to move to a different version, so source and
+target are version-mismatched for the entire cutover window. This section
+covers what was found running source on `mongo:4.4` and target on `mongo:8.0`
+against a real kind cluster — the widest practical gap, chosen deliberately
+over the originally-planned 7.0/6.0→8.0 to maximize the chance of surfacing
+real version-driven behavior.
+
+### 0. A precondition this testing pass had to fix first: `cmd/mongogate` did not exist
+
+Before any of this could run, building the E2E tools image failed:
+`stat /app/cmd/mongogate: directory not found`. Checked thoroughly, not
+assumed: `git log --all -- cmd/` returns nothing on any branch (`main`,
+`add-e2e-testing`, or their remotes); the only `package main` in the entire
+repository was `test/e2e/loadgen/main.go` (the test helper, not the product);
+`internal/` had no `Run()`/`Execute()` orchestration function either. CI's
+`go build ./...` never caught this because `./...` only builds packages that
+exist — with no `cmd/mongogate` directory, there was nothing for it to fail
+on. The workflow that *does* reference it explicitly, `release.yml` (via
+`deploy/Dockerfile`'s `go build ... ./cmd/mongogate`), was confirmed failing
+on `main` via `gh run list`. This means **no version of `mongogate` has ever
+been a runnable binary**, which calls into question how the scenarios in
+sections 1-7 above were actually exercised.
+
+`cmd/mongogate/main.go` was written for this pass, wiring the existing
+`internal/` building blocks (every `verifier.Verify*` function, `report`,
+`alert`, `monitor`, `httpapi`, `internal/prometheus`, `repair`, `export`)
+into the CLI documented in `README.md` (`--phase`, `--resume`, `--dry-run`,
+`--include-ns`/`--exclude-ns`, `--auto-repair`, `--export-csv`). It builds,
+vets, and lints clean, and is what produced every result below.
+
+A contributing factor found along the way: `.gitignore` had a bare
+`mongogate` entry (no leading slash), which in gitignore syntax matches a
+file or directory of that name *anywhere* in the tree — including
+`cmd/mongogate/`. That silently hid the directory from `git status`/`git add
+.`, which would have kept a real `cmd/mongogate/main.go` invisible to git
+even if someone had written one. Fixed by anchoring it to `/mongogate` (the
+built binary at repo root, which is what the rule was actually meant for).
+
+### 1. Environment
+
+```
+mongo-source: 3-pod replica set, mongo:4.4.30
+mongo-target: 3-pod replica set, mongo:8.0.26
+```
+
+`mongo:4.4` had never been pulled in this repo before (only 7.0/8.0 had
+prior history). Two real setup problems surfaced immediately, both fixed in
+`test/e2e/scripts/setup.sh` and `test/e2e/kind/source/statefulset.yaml`:
+
+- **`mongo:4.4` has no `mongosh`** — only the legacy `mongo` shell (`mongosh`
+  was only added to the official image starting around the 6.0 line).
+  `setup.sh`'s hardcoded `mongosh` calls and the source StatefulSet's
+  `readinessProbe`/`livenessProbe` had to switch to `mongo` for the source
+  namespace specifically (target stays on `mongosh`).
+- **The two shells disagree on error behavior.** `rs.status()` (and even raw
+  `db.adminCommand({replSetGetStatus:1})`) returns `{ok:0,...}` without
+  throwing in the legacy `mongo` shell, but throws a `MongoServerError` in
+  `mongosh`. The original `try { rs.status(); print('already initiated') }
+  catch { rs.initiate(...) }` logic silently skipped `rs.initiate()` on the
+  4.4 side because the legacy shell never threw. Fixed by checking `.ok`
+  explicitly *and* keeping the catch block, so it's correct under either
+  shell's behavior.
+
+### 2. Phase 1 structural diff, real run
+
+`./mongogate --phase 1` against the seeded baseline (`loadgen seed-baseline`
++ `seed-users`, unmodified):
+
+```
+📁 [Phase1] Verifying [migtest] collections
+  ❌ FAIL   migtest collections (15 collections)
+  ❌ Index [migtest.timeseries_col]
+     ⚠️  Extra index in target: meta_1_ts_1
+...
+  migtest.*: ❌ FAIL
+  ⚠️  Extra collection: migtest.system.buckets.timeseries_col
+```
+
+Auth and Cluster sections both passed cleanly — built-in role privilege
+diffs and `2dsphereIndexVersion`/index-version defaults (plan.md's risks #1
+and #2) did **not** actually manifest between a freshly-seeded 4.4 and 8.0
+cluster in this run. Worth recording as a real negative result, not just
+"untested": the most-anticipated risk didn't fire here.
+
+### 3. A confirmed bug worse than the one anticipated
+
+The plan going in expected `timeseries_col`/`clustered_col` to be **missing**
+on the 4.4 source, since time series (5.0+) and clustered collections (5.3+)
+postdate it, and `loadgen`'s `seedBaselineOn` swallows all creation errors.
+That's not what happens. Checked directly:
+
+```
+source timeseries_col: {"type":"collection","options":{},...}        (plain collection)
+target timeseries_col: {"type":"timeseries","options":{"timeseries":{...}}}
+
+source clustered_col indexes: [{"v":2,"key":{"_id":1},"name":"_id_"}]
+target clustered_col indexes: [{"v":2,"key":{"_id":1},"name":"_id_","unique":true,"clustered":true}]
+```
+
+MongoDB 4.4's `create` command silently **ignores** the unrecognized
+`timeseries`/`clusteredIndex` options instead of rejecting the command. Both
+collections get created under the requested name, with normal-collection
+semantics underneath — not missing, not erroring, just silently the wrong
+kind of collection. This is strictly worse for a real migration than a
+missing-collection error would be: nothing about the name or existence check
+flags it.
+
+mongogate misses this almost completely:
+- `verifyCollectionOptions` compares the `timeseries`/`clusteredIndex` option
+  keys via `compareBSONFields` (`schema_verifier.go:101-109`), which
+  explicitly **skips any field the source side doesn't have**
+  (`types.go:24`: `sv != "<nil>"`) — and a plain collection's options simply
+  doesn't have those keys, so the skip swallows the entire diff at the
+  options level for both collections.
+- For `clustered_col` specifically, there is **no signal at all** — Phase 1
+  reported it `✅ PASS`. `VerifyIndexes` (`index_verifier.go:22,31`)
+  unconditionally skips the `_id_` index by name on both sides
+  (`if name == "_id_" { continue }`), and a clustered collection's defining
+  characteristic (`unique`/`clustered` on that exact index) lives nowhere
+  else to compare.
+- For `timeseries_col`, the only signals that leak through are indirect and
+  easy to misread: the internal `system.buckets.timeseries_col` storage
+  collection shows up as an "extra collection in target" (not "timeseries_col
+  itself differs"), and the auto-created metadata index `meta_1_ts_1` shows
+  up as an "extra index." A human reading the report would have to already
+  know to connect those two artifacts back to "the collection type itself is
+  wrong" — nothing says that directly.
+
+### 4. The three other blind spots from this session, confirmed live
+
+Each deliberately diverged on the running 4.4/8.0 pair, then re-checked with
+`./mongogate --phase 1`:
+
+| Blind spot | Diverged how | mongogate result |
+|---|---|---|
+| Server parameter outside the checked 2 (`slowOpThresholdMs`, `maxIncomingConnections`) | `setParameter notablescan`: `true` on source, `false` on target | `✅ PASS Cluster settings` |
+| Per-user auth mechanism | root user: `["SCRAM-SHA-1","SCRAM-SHA-256"]` on source, `["SCRAM-SHA-256"]` only on target | `✅ PASS Account permissions` |
+| Default cluster-wide read/write concern | not set explicitly anywhere — see below | `✅ PASS Cluster settings` (same run as above) |
+
+`cluster_verifier.go` never calls `getDefaultRWConcern` at all (confirmed by
+repo-wide grep), so the third row isn't really a "diverged" case — it's
+naturally different just from being different versions:
+
+```
+source (4.4): getDefaultRWConcern → no defaultWriteConcern/defaultReadConcern fields at all
+target (8.0): {"defaultReadConcern":{"level":"local"},
+               "defaultWriteConcern":{"w":"majority","wtimeout":0},
+               "defaultWriteConcernSource":"implicit", ...}
+```
+
+This is a genuine durability-semantics difference (implicit majority write
+concern, a real MongoDB behavior change), not metadata noise, and it exists
+on every fresh 4.4-vs-8.0 pair without anyone configuring anything.
+
+### 5. FCV — also naturally different, also unchecked
+
+```
+source (4.4): featureCompatibilityVersion = "4.4"
+target (8.0): featureCompatibilityVersion = "8.0"
+```
+
+Confirms plan.md risk #4. `cluster_verifier.go` has no FCV-reading code at
+all (repo-wide grep, zero hits). Note the nuance: this particular pair's FCV
+difference is just a side effect of being different binaries, not the
+"staged rollout, same binary, deliberately held-back FCV" scenario plan.md
+originally described — that's a different, not-yet-tested setup (same
+version on both sides, FCV pinned down on one).
+
+### 6. Collation/ICU — explored, no reproducible difference found
+
+Tried a German-locale (`strength:1`) sort across `ß`/`ss`-style strings and
+`ñ`-adjacent ordering, real `.find().sort()` output compared directly via
+shell on both sides (bypassing mongogate, which only ever compares the
+collation *option string* — see plan.md risk #3):
+
+```
+both sides: ["ñ", "n", "nz", "oz", "Strasse", "Straße", "Strasze"]
+```
+
+Identical. No ICU sort-order divergence found between whatever ICU versions
+ship with 4.4 vs 8.0 for these specific inputs. Per the original plan, this
+was always exploratory, not a hard requirement — recorded as a real negative
+result rather than left untested.
+
+---
+
 ## Known limitations
 
 Not all "limitation" means the same thing. The table below ranks these by
@@ -461,10 +651,18 @@ write-ups below just to know which is which:
 | 2 | Deprecated BSON types | Cosmetic only | **Yes, trivially** — comparison/diff detection already works; only the displayed type name is ugly |
 | 3 | Vector/Atlas Search index definitions | Structural blind spot | **No, not with this approach** — `VerifyIndexes` calls `listIndexes`, which cannot see mongot's catalog at all; would need an entirely different mechanism (talking to mongot/Atlas Search APIs directly) |
 | 4 | Queryable Encryption | Fundamental ceiling | **No, never** — impossible by the design of encryption itself; no amount of engineering on this tool fixes it without the encryption keys |
+| 5 | Collection options / index options use a fixed field allowlist | Confirmed blind spot (section 8.3) | **Yes** — `compareBSONFields` (`types.go:19-29`) only compares a hardcoded field list and skips anything the source side doesn't have; confirmed it silently misses a 4.4 collection masquerading as `timeseries`/`clusteredIndex` on the target. Fixing means inverting the allowlist to a denylist (compare the full raw doc, exclude only known-legitimate-to-differ fields), not yet done. |
+| 6 | `_id_` index unconditionally skipped | Confirmed blind spot (section 8.3) | **Yes** — `VerifyIndexes` (`index_verifier.go:22,31`) skips `_id_` by name on both sides unconditionally; this is the only index a clustered collection has, so clustered-vs-plain divergence on `_id_` (`unique`/`clustered` flags) produces zero signal at all. |
+| 7 | Cluster server parameters checked = 2 of hundreds | Confirmed blind spot (section 8.4) | **Yes** — `cluster_verifier.go:33` hardcodes exactly `slowOpThresholdMs`/`maxIncomingConnections`; confirmed a third (`notablescan`) set differently produces no diff. |
+| 8 | Per-user auth mechanism never checked | Confirmed blind spot (section 8.4) | **Yes** — `getUsers` (`auth_verifier.go:87-107`) only reads `user`/`roles`, never `mechanisms`; confirmed same user/roles with different `mechanisms` on each side reports as matching. |
+| 9 | Cluster-wide default read/write concern never checked | Confirmed blind spot (section 8.4) | **Yes** — no code anywhere calls `getDefaultRWConcern`; confirmed a real, version-driven durability-semantics difference (4.4 vs 8.0 implicit write concern) produces no diff. |
+| 10 | FCV never read or compared | Confirmed blind spot (section 8.5) | **Yes** — cheap addition (`getParameter: featureCompatibilityVersion`), informational line in the Phase 1 report would cover it; not yet implemented. |
 
 Items 3 and 4 are the two that are genuinely "cannot verify," not just
 "didn't get to it" — worth reading in full if evaluating whether to rely on
-this tool for a migration that uses either feature.
+this tool for a migration that uses either feature. Items 5-10 were all
+found and confirmed live in section 8 (cross-version testing) — all fixable,
+none fixed yet; see that section for the evidence behind each.
 
 1. **Sharded clusters** (mongos + config servers) were never tested — every
    scenario in this document ran against replica sets. `verify.sharding`

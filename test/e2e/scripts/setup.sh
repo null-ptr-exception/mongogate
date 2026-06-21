@@ -22,6 +22,10 @@ kubectl apply -f "$KIND_DIR/namespaces.yaml"
 
 setup_replica_set() {
   local ns="$1"
+  # mongo:4.4 images only bundle the legacy `mongo` shell, not `mongosh`
+  # (added starting around the 6.0 image line) - cross-version test pass.
+  local shell="mongosh"
+  [ "$ns" = mongo-source ] && shell="mongo"
   echo "==> [$ns] Generating keyfile secret..."
   if ! kubectl -n "$ns" get secret mongo-keyfile >/dev/null 2>&1; then
     openssl rand -base64 756 > /tmp/mongo-keyfile-$ns
@@ -37,11 +41,12 @@ setup_replica_set() {
   kubectl -n "$ns" wait --for=jsonpath='{.status.readyReplicas}'=3 statefulset/mongo --timeout=240s
 
   echo "==> [$ns] Initiating replica set..."
-  kubectl -n "$ns" exec mongo-0 -- mongosh --quiet --eval "
-    try {
-      rs.status();
-      print('replica set already initiated');
-    } catch (e) {
+  # Both the throw-on-error path (mongosh) and the return-ok:0 path (legacy
+  # mongo shell, pre-6.0 images) need handling here - the two shells disagree
+  # on whether replSetGetStatus failing throws a JS exception or just
+  # returns {ok:0,...}, so check both.
+  kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet --eval "
+    function doInitiate() {
       rs.initiate({
         _id: 'rs0',
         members: [
@@ -51,11 +56,21 @@ setup_replica_set() {
         ]
       });
     }
+    try {
+      var st = db.adminCommand({replSetGetStatus: 1});
+      if (st.ok === 1) {
+        print('replica set already initiated');
+      } else {
+        doInitiate();
+      }
+    } catch (e) {
+      doInitiate();
+    }
   "
 
   echo "==> [$ns] Waiting for PRIMARY election..."
   for i in $(seq 1 30); do
-    STATE=$(kubectl -n "$ns" exec mongo-0 -- mongosh --quiet --eval "rs.status().members.some(m => m.stateStr === 'PRIMARY')" 2>/dev/null | tail -1)
+    STATE=$(kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet --eval "rs.status().members.some(m => m.stateStr === 'PRIMARY')" 2>/dev/null | tail -1)
     if [ "$STATE" = "true" ]; then
       echo "    PRIMARY elected"
       break
@@ -64,7 +79,7 @@ setup_replica_set() {
   done
 
   echo "==> [$ns] Creating root user (via localhost exception)..."
-  kubectl -n "$ns" exec mongo-0 -- mongosh --quiet --eval "
+  kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet --eval "
     db.getSiblingDB('admin').runCommand({ping:1});
     try {
       db.getSiblingDB('admin').createUser({
@@ -88,6 +103,6 @@ kubectl apply -f "$KIND_DIR/monitor/deployment.yaml"
 kubectl -n mongogate-test wait --for=condition=Ready pod -l app=monitor-mongo --timeout=120s
 
 echo "==> Environment is up."
-echo "    Source: kubectl -n mongo-source exec mongo-0 -- mongosh"
+echo "    Source: kubectl -n mongo-source exec mongo-0 -- mongo"
 echo "    Target: kubectl -n mongo-target exec mongo-0 -- mongosh"
 echo "    Monitor: kubectl -n mongogate-test exec deploy/monitor-mongo -- mongosh"
