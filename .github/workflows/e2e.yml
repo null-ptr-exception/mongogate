@@ -103,21 +103,29 @@ jobs:
         run: |
           SRC="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
           TGT="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
-          # setup.sh already waits for the root user to be usable, but
-          # confirmed live that's not sufficient under GHA's resource
-          # pressure (6 mongod processes + a concurrent Docker build) -
-          # intermittent AuthenticationFailed still slipped through after
-          # that check passed. Retry the actual seed calls as the final
-          # layer of defense, since this class of failure is transient by
-          # nature and resolves within seconds.
+          # Reordering the build step (previous commit) didn't fully close
+          # this either - still recurs. Dumping real replica set state on
+          # every failed attempt instead of guessing again: if rs.status()
+          # itself can't authenticate, the problem is cluster-wide, not
+          # loadgen-specific; if it can, the member states/health below
+          # will show what's actually wrong.
+          dump_diag() {
+            for ns in mongo-source mongo-target; do
+              echo "--- DIAGNOSTIC: $ns rs.status() ---"
+              kubectl -n "$ns" exec mongo-0 -- mongosh --quiet -u root -p rootpass123 --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || kubectl -n "$ns" exec mongo-0 -- mongo --quiet -u root -p rootpass123 --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || echo "(failed to query $ns directly too - cluster-wide issue, not loadgen-specific)"
+            done
+          }
           retry() {
             local desc="$1"; shift
-            for i in $(seq 1 5); do
+            for i in $(seq 1 10); do
               if "$@"; then return 0; fi
-              echo "::warning::$desc attempt $i failed, retrying in 10s..."
-              sleep 10
+              echo "::warning::$desc attempt $i failed, retrying in 15s..."
+              dump_diag
+              sleep 15
             done
-            echo "::error::$desc failed after 5 attempts"
+            echo "::error::$desc failed after 10 attempts"
             return 1
           }
           retry "seed-baseline" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
@@ -223,18 +231,27 @@ jobs:
         run: |
           SRC="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
           TGT="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
-          # See the happy-path job's "Seed identical baseline" step for why:
-          # setup.sh's readiness check alone wasn't sufficient under GHA's
-          # resource pressure - confirmed live, intermittent
-          # AuthenticationFailed still slipped through after it passed.
+          # See the happy-path job's "Seed identical baseline" step for the
+          # full history - readiness checks and build reordering both
+          # helped but didn't fully close this. Dumping real replica set
+          # state on every failed attempt instead of guessing again.
+          dump_diag() {
+            for ns in mongo-source mongo-target; do
+              echo "--- DIAGNOSTIC: $ns rs.status() ---"
+              kubectl -n "$ns" exec mongo-0 -- mongosh --quiet -u root -p rootpass123 --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || kubectl -n "$ns" exec mongo-0 -- mongo --quiet -u root -p rootpass123 --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || echo "(failed to query $ns directly too - cluster-wide issue, not loadgen-specific)"
+            done
+          }
           retry() {
             local desc="$1"; shift
-            for i in $(seq 1 5); do
+            for i in $(seq 1 10); do
               if "$@"; then return 0; fi
-              echo "::warning::$desc attempt $i failed, retrying in 10s..."
-              sleep 10
+              echo "::warning::$desc attempt $i failed, retrying in 15s..."
+              dump_diag
+              sleep 15
             done
-            echo "::error::$desc failed after 5 attempts"
+            echo "::error::$desc failed after 10 attempts"
             return 1
           }
           retry "seed-baseline" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
