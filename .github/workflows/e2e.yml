@@ -91,8 +91,25 @@ jobs:
         run: |
           SRC="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
           TGT="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
-          kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
-          kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-users --src "$SRC" --tgt "$TGT"
+          # setup.sh already waits for the root user to be usable, but
+          # confirmed live that's not sufficient under GHA's resource
+          # pressure (6 mongod processes + a concurrent Docker build) -
+          # intermittent AuthenticationFailed still slipped through after
+          # that check passed. Retry the actual seed calls as the final
+          # layer of defense, since this class of failure is transient by
+          # nature and resolves within seconds.
+          retry() {
+            local desc="$1"; shift
+            for i in $(seq 1 5); do
+              if "$@"; then return 0; fi
+              echo "::warning::$desc attempt $i failed, retrying in 10s..."
+              sleep 10
+            done
+            echo "::error::$desc failed after 5 attempts"
+            return 1
+          }
+          retry "seed-baseline" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
+          retry "seed-users" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-users --src "$SRC" --tgt "$TGT"
 
       - name: Phase 1 must pass on an identical same-version baseline
         run: kubectl -n mongogate-test exec e2e-tools -- /app/mongogate --phase 1
@@ -186,8 +203,22 @@ jobs:
         run: |
           SRC="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
           TGT="mongodb://root:rootpass123@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
-          kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
-          kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-users --src "$SRC" --tgt "$TGT"
+          # See the happy-path job's "Seed identical baseline" step for why:
+          # setup.sh's readiness check alone wasn't sufficient under GHA's
+          # resource pressure - confirmed live, intermittent
+          # AuthenticationFailed still slipped through after it passed.
+          retry() {
+            local desc="$1"; shift
+            for i in $(seq 1 5); do
+              if "$@"; then return 0; fi
+              echo "::warning::$desc attempt $i failed, retrying in 10s..."
+              sleep 10
+            done
+            echo "::error::$desc failed after 5 attempts"
+            return 1
+          }
+          retry "seed-baseline" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
+          retry "seed-users" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-users --src "$SRC" --tgt "$TGT"
 
       # Phase 1 is *expected* to report diffs for 4.4/5.0/6.0 (that's the
       # point of this matrix) - the assertion below checks for the exact,
