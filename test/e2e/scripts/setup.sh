@@ -114,6 +114,27 @@ setup_replica_set() {
     }
   " || true
 
+  # createUser only waits for the configured write concern (majority on
+  # 8.0's implicit default, but not necessarily all 3 members, and not
+  # guaranteed at all on older defaults) - a client connecting with the
+  # full mongo-0,1,2 seed list (as loadgen does) authenticates against
+  # every discovered member, including any secondary that hasn't replayed
+  # the new user yet. Caught this for real: a CI run failed with
+  # "AuthenticationFailed" from loadgen hitting exactly that race. Close
+  # the window by confirming the user is independently authenticatable on
+  # every member before declaring the replica set ready.
+  echo "==> [$ns] Waiting for root user to replicate to every member..."
+  for member in mongo-0 mongo-1 mongo-2; do
+    for i in $(seq 1 30); do
+      if kubectl -n "$ns" exec "$member" -- "$shell" --quiet \
+           -u root -p rootpass123 --authenticationDatabase admin \
+           --eval "1" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+  done
+
   echo "==> [$ns] Replica set ready."
 }
 

@@ -1012,6 +1012,22 @@ including all four matrix entries, alongside the pre-existing
 `go build`/`vet`/`test`/`golangci-lint` job. Runtime: ~3-4 minutes per
 job, all five running in parallel.
 
+**A real flake found by watching repeated real runs, not assumed
+flaky-and-ignored**: a later push's `happy-path` job failed twice in a
+row with `loadgen` reporting `AuthenticationFailed` against the source
+replica set, while every `cross-version-matrix` job in the same runs
+passed. Root cause: `createUser` only waits for the configured write
+concern (majority on 8.0's implicit default - not necessarily *every*
+member, and not guaranteed at all on older defaults) before returning,
+but `loadgen`'s connection string lists all three `mongo-0,1,2` hosts and
+the driver authenticates against each one it discovers - including any
+secondary that hasn't replicated the new user yet. Fixed in `setup.sh`:
+after creating the root user, poll each of the three members directly
+with the new credentials until all three accept them, before declaring
+the replica set ready. This is exactly the kind of flake an
+infrastructure change can introduce invisibly - found because the new
+CI was actually watched run-over-run, not just confirmed green once.
+
 ---
 
 ## 13. Structured code review of this entire branch's diff
