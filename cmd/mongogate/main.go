@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -59,6 +61,13 @@ func main() {
 		cfg.ExportCSV = *exportCSV
 	}
 
+	// Job-scope the checkpoint file to this source/target pair: a single
+	// hardcoded checkpoints.json would let two different migration jobs run
+	// from the same working directory silently clobber each other's --resume
+	// state.
+	jobKey := sha256.Sum256([]byte(cfg.SourceURI + "|" + cfg.TargetURI))
+	utils.SetCheckpointFile(fmt.Sprintf("checkpoints_%s.json", hex.EncodeToString(jobKey[:6])))
+
 	runPhase1 := *phase == "1" || *phase == "all"
 	runPhase2 := *phase == "2" || *phase == "all"
 	runPhase3 := *phase == "3" || *phase == "all"
@@ -84,6 +93,7 @@ func main() {
 	}
 
 	rpt := report.New()
+	verifier.FetchVersionInfo(ctx, src, tgt, rpt)
 	am := alert.New(cfg.Alert)
 	pm := promMetrics.New(cfg.PrometheusPort, rpt)
 	pm.Start()
@@ -129,6 +139,17 @@ func main() {
 		}
 
 		for _, col := range cols {
+			if isGridFSInternal(col) {
+				// fs.files/fs.chunks are already verified properly by
+				// VerifyGridFS (content hash + metadata, both sides read
+				// through the GridFS API). Generic per-document comparison
+				// here would always false-positive: fs.chunks' per-chunk
+				// _id is a fresh ObjectID minted independently on each
+				// upload, and fs.files' uploadDate is wall-clock time at
+				// upload - neither matches across independently-seeded
+				// sides even when the actual file content is identical.
+				continue
+			}
 			collections = append(collections, verifier.CollectionTask{DBName: db, ColName: col})
 		}
 	}
@@ -235,6 +256,14 @@ func softConnect(ctx context.Context, label, uri string) *mongo.Client {
 func promptContinue(msg string) {
 	fmt.Printf("\n%s ", msg)
 	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+}
+
+// isGridFSInternal matches the default GridFS bucket prefix ("fs") used by
+// both loadgen and this codebase's own VerifyGridFS. A custom bucket prefix
+// (gridfs.NewBucket with BucketOptions.SetName) would not be caught here -
+// out of scope for this check, since nothing in this codebase uses one.
+func isGridFSInternal(colName string) bool {
+	return colName == "fs.files" || colName == "fs.chunks"
 }
 
 func toHashOptions(h config.HashOptions) utils.HashOptions {

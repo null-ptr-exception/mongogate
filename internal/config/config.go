@@ -97,7 +97,14 @@ func defaults() *Config {
 		RetryWaitMS:               500,
 		Phase2LagThresholdSeconds: 10,
 		SampleRate:                0.1,
-		SkipDBs:                   []string{"local", "config"},
+		// "admin" is skipped by default: its meaningful content (users,
+		// roles, replica set config) is already covered by dedicated,
+		// purpose-built checks (VerifyAuth, VerifyCluster) via proper admin
+		// commands. Generic raw-document comparison of admin.system.users
+		// guarantees false positives - SCRAM credentials are freshly salted
+		// per createUser call, so the same password produces different
+		// stored bytes on each side even on a 100% correct migration.
+		SkipDBs:                   []string{"local", "config", "admin"},
 		HTTPPort:                  0,
 		PrometheusPort:            0,
 	}

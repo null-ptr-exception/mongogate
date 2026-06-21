@@ -14,6 +14,8 @@ retry_wait_ms: 500
 skip_dbs:
   - local
   - config
+  - admin   # users/roles/replset config are already verified by VerifyAuth/VerifyCluster;
+            # raw-comparing admin.system.users always false-positives (fresh SCRAM salt per side)
 # include_ns:           # only verify these (empty = everything)
 #   - mydb.users
 #   - mydb.*

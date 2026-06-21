@@ -43,10 +43,23 @@ type DataResult struct {
 	ExtraInTargetSample  []string     `json:"extra_in_target_sample,omitempty"`
 }
 
+// VersionInfo is informational only - it never affects Passed/exit code.
+// Surfaced so a human reading the report has the context to correctly
+// interpret version-driven diffs elsewhere instead of being surprised by
+// them (e.g. a built-in role privilege diff that's actually just a MongoDB
+// version difference, not a migration bug).
+type VersionInfo struct {
+	SrcVersion string `json:"src_version"`
+	TgtVersion string `json:"tgt_version"`
+	SrcFCV     string `json:"src_fcv"`
+	TgtFCV     string `json:"tgt_fcv"`
+}
+
 type Report struct {
 	mu          sync.RWMutex
 	StartTime   time.Time              `json:"start_time"`
 	EndTime     time.Time              `json:"end_time"`
+	Versions    *VersionInfo           `json:"versions,omitempty"`
 	Auth        *Result                `json:"auth,omitempty"`
 	Cluster     *Result                `json:"cluster,omitempty"`
 	Databases   *Result                `json:"databases,omitempty"`
@@ -69,6 +82,7 @@ func New() *Report {
 }
 
 // ── Setters (thread-safe) ──
+func (r *Report) SetVersions(v *VersionInfo)             { r.mu.Lock(); defer r.mu.Unlock(); r.Versions = v }
 func (r *Report) SetAuth(res *Result)                    { r.mu.Lock(); defer r.mu.Unlock(); r.Auth = res }
 func (r *Report) SetCluster(res *Result)                 { r.mu.Lock(); defer r.mu.Unlock(); r.Cluster = res }
 func (r *Report) SetDatabases(res *Result)               { r.mu.Lock(); defer r.mu.Unlock(); r.Databases = res }
@@ -135,6 +149,10 @@ func (r *Report) Print() {
 	fmt.Printf("   Start    : %s\n", r.StartTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("   End      : %s\n", r.EndTime.Format("2006-01-02 15:04:05"))
 	fmt.Printf("   Duration : %s\n", r.EndTime.Sub(r.StartTime).Round(time.Second))
+	if r.Versions != nil {
+		fmt.Printf("   Source   : version=%s fcv=%s\n", r.Versions.SrcVersion, r.Versions.SrcFCV)
+		fmt.Printf("   Target   : version=%s fcv=%s\n", r.Versions.TgtVersion, r.Versions.TgtFCV)
+	}
 	fmt.Println(line("=", 65))
 
 	printResult("🔐 Account permissions", r.Auth)

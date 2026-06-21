@@ -66,7 +66,8 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 15 | CLI/config matrix | ✅ `--dry-run`, `--exclude-ns "db.*"`, multi-entry `include_ns`/`exclude_ns`, combined include+exclude, bad-config validation all correct |
 | 16 | Comparison-logic bugs (UTF-8 truncation, negative zero, role privileges, array-of-docs recursion) | ✅ All 4 confirmed real, fixed, unit- and E2E-tested — see section 6 |
 | 17 | New data formats on MongoDB 8.0 (vector embeddings, time series, clustered collection, collation, hidden index, real geo data, large documents) | ✅ Mostly clean on the first try; found a real structural limitation (time series bucket `_id`) and a real performance characteristic (large-document memory multiplier) — see section 7 |
-| 18 | Cross-version source/target (4.4 → 8.0) | ⚠️ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections — fixed (`compareBSONFields` asymmetric skip, `_id_` index skip), re-verified live; plus 4 confirmed-but-not-yet-fixed blind spots (server params, per-user auth mechanism, default RW concern, FCV) — see section 8 |
+| 18 | Cross-version source/target (4.4 → 8.0) | ⚠️ Found that `cmd/mongogate` never existed as a buildable binary (written this pass) and a bug worse than predicted: version-incompatible collection options are silently dropped by 4.4 instead of erroring, producing same-name/wrong-type collections — fixed (`compareBSONFields` asymmetric skip, `_id_` index skip), re-verified live; plus 3 confirmed-but-not-yet-fixed blind spots (server params, per-user auth mechanism, default RW concern) — see section 8 |
+| 19 | Deeper code review + first-ever real Phase 3 run | ⚠️ Found and fixed 4 more gaps (GridFS content check was dead code, checkpoint file was global not job-scoped, role inheritance never compared, replica topology never compared) plus a regression those fixes would have hit (admin/GridFS-internal collections guarantee false positives under generic comparison) and its proper replacement (dedicated FCV/version info, non-blocking) — see section 9 |
 
 ### Bugs found and fixed during this pass
 
@@ -666,6 +667,137 @@ result rather than left untested.
 
 ---
 
+## 9. Deeper code review: 4 more confirmed gaps, all fixed and re-verified
+
+With a real binary finally available (section 8.0), Phase 3 (full data
+verification) was run for real for the first time in this project's
+history. That, plus a deliberate second read of the code looking
+specifically for "what else hasn't been thought about," found four more
+real gaps. All four are fixed in this pass, not just documented.
+
+### 9.1 GridFS content verification was dead code
+
+`gridfs_verifier.go`'s `fullVerify` branch compared `fs.files`'s `md5`
+field. Checked the vendored driver source directly
+(`go.mongodb.org/mongo-driver@v1.13.1/mongo/gridfs/upload_stream.go:196-203`):
+the file document it writes only has `_id`, `length`, `chunkSize`,
+`uploadDate`, `filename`, `metadata` — **no `md5` field, ever**, on any
+MongoDB version. The driver removed automatic MD5 generation
+industry-wide (FIPS compliance) years ago. Both sides' `md5` were always
+`<nil>`, always equal, so the check never fired regardless of whether
+content actually matched. README's "GridFS | Metadata + content MD5"
+claim (line 106) was not true.
+
+**Fixed**: `gridFSContentHash` (`gridfs_verifier.go`) streams the actual
+file content through SHA256 via the GridFS download API (`io.Copy`, no
+full-file buffering, so memory stays flat regardless of file size - the
+same property the rest of this tool relies on). Only runs in Phase 3, and
+only when sizes already match (a size mismatch already proves content
+differs without needing to read it).
+
+### 9.2 Checkpoint file was global, not job-scoped
+
+`internal/utils/checkpoint.go` used a single hardcoded `checkpoints.json`
+in the working directory, keyed only by namespace. Two different migration
+jobs (or the same job run twice by accident) from the same working
+directory would silently corrupt each other's `--resume` state.
+
+**Fixed**: `SetCheckpointFile` (lazy-loaded, no more package `init()`)
+lets the caller override the path; `cmd/mongogate/main.go` now derives one
+from a SHA256 of `source_uri|target_uri`, so different job configs
+automatically get different checkpoint files without requiring a manual
+job ID.
+
+### 9.3 Custom role inheritance was never compared
+
+`getRoles` (`auth_verifier.go`) only ever read `rm["privileges"]`. MongoDB
+roles can inherit from other roles (`rolesInfo`'s `roles` field) - a role
+on one side inheriting differently than its same-named counterpart on the
+other side produced no diff at all.
+
+**Fixed**: `getRoles` now also extracts and normalizes the inherited-role
+list (`normalizeInheritedRoles`), compared as a second, separately-labeled
+check ("different inherited roles") alongside the existing privilege check.
+
+### 9.4 Replica set member topology was never compared
+
+`getReplicaSetConfig` fetched the entire `replSetGetConfig` document but
+only ever compared two scalar fields. Member count, arbiters, voting
+members, hidden/delayed secondaries, tags - fetched, then ignored. A
+migration that changes topology (e.g. 3 data-bearing nodes →
+2-data+1-arbiter) produced no diff, despite real write-durability and
+failover differences.
+
+**Fixed**: `summarizeTopology` aggregates member count, arbiter count,
+voting member count, hidden count, and delayed-secondary count (raw
+per-host comparison isn't useful - hostnames always differ between source
+and target) and reports a mismatch by aggregate counts.
+
+### 9.5 A regression these fixes would have caused, caught before it shipped: generic data verification produces guaranteed false positives on `admin` and on GridFS internals
+
+Running `--phase 3` for real (also a first) surfaced this independently of
+9.1-9.4. Two collections always false-positive under the generic
+per-document `DeepCompare` sweep, regardless of whether the migration is
+correct:
+
+- **`admin.system.users`**: real diff output (`migtest`/`admin` pair from
+  this pass) showed every credential field differing -
+  `credentials.SCRAM-SHA-1.salt`, `.storedKey`, `.serverKey`, even
+  `userId` itself - because SCRAM credentials are freshly salted on every
+  `createUser` call. The *same password*, created independently on each
+  side (exactly what `loadgen seed-users` does, and what migrating users
+  by recreating them rather than copying raw documents looks like in
+  practice), produces different bytes every time by design. This isn't
+  fixable by normalizing the hash - the underlying values are genuinely
+  different and *should* be, even on a perfect migration.
+- **`migtest.fs.files`/`fs.chunks`**: `fs.files.uploadDate` differs by
+  wall-clock upload time; `fs.chunks`' per-chunk `_id` is a fresh
+  ObjectID minted independently on each upload (the fixed-`_id` trick
+  `loadgen` already uses only covers the parent file document, not its
+  chunks). Both already-correctly verified by the dedicated `VerifyGridFS`
+  check (now with real content hashing per 9.1) - the generic sweep was
+  re-checking the same data through a path that's guaranteed to flag it as
+  wrong.
+
+Real captured diffs before the fix:
+```
+{'doc_id': 'admin.appuser', 'path': 'credentials.SCRAM-SHA-1.salt', 'src_value': 'YYCjvO7vABZe/gZm8f+x0w==', 'tgt_value': 'j1xKVvIAPeBAol0Kl546TQ=='}
+{'doc_id': 'featureCompatibilityVersion', 'path': 'version', 'src_value': '4.4', 'tgt_value': '8.0'}
+{'doc_id': 'ObjectID("...0001")', 'path': 'uploadDate', 'src_value': 'dt:...07:43:57.341Z', 'tgt_value': 'dt:...07:43:58.419Z'}
+fs.chunks: missing=1 (ObjectID("6a37963d...")), extra_in_target=1 (ObjectID("6a37963e..."))
+```
+
+(The `admin.system.version` row above is also where this pass discovered
+that the FCV value is incidentally readable through `admin.system.version`
+- but that's a side effect of a collection that shouldn't be raw-compared
+in the first place, not a real signal worth relying on.)
+
+**Fixed**: `admin` added to the default `skip_dbs` (`config.go`,
+`config.yaml`) - its meaningful content is already covered by dedicated
+checks (`VerifyAuth` via `usersInfo`, `VerifyCluster` via
+`replSetGetConfig`), so raw-comparing the rest of it is pure redundant
+risk. `fs.files`/`fs.chunks` excluded from the Phase 2/3 collection list
+in `cmd/mongogate/main.go` (`isGridFSInternal`) since `VerifyGridFS`
+already covers them correctly.
+
+**Losing the incidental FCV signal was a real cost of that fix** - so a
+proper, dedicated replacement was added instead of leaving a gap:
+`verifier.FetchVersionInfo` reads `buildInfo.version` and
+`featureCompatibilityVersion` directly via `getParameter` on both sides
+and stores them on `report.Report.Versions` - informational only, never
+affects `Passed`, printed in every report header. This is exactly the
+follow-up plan.md originally proposed ("an informational line... so a
+human has the context to correctly interpret version-driven diffs") and
+item 8 in the previous revision of Known Limitations below - now done.
+
+Re-verified live after all of 9.1-9.5: same 4.4/8.0 pair, `--phase 3`
+clean except the two genuine `timeseries_col`/`clustered_col` failures -
+zero false positives, GridFS content hash confirmed passing on identical
+content, version line confirmed printing `Source: version=4.4.30 fcv=4.4`
+/ `Target: version=8.0.26 fcv=8.0`.
+
+---
+
 ## Known limitations
 
 Not all "limitation" means the same thing. The table below ranks these by
@@ -681,17 +813,20 @@ write-ups below just to know which is which:
 | 5 | Cluster server parameters checked = 2 of hundreds | Confirmed blind spot (section 8.4) | **Yes** — `cluster_verifier.go:33` hardcodes exactly `slowOpThresholdMs`/`maxIncomingConnections`; confirmed a third (`notablescan`) set differently produces no diff. |
 | 6 | Per-user auth mechanism never checked | Confirmed blind spot (section 8.4) | **Yes** — `getUsers` (`auth_verifier.go:87-107`) only reads `user`/`roles`, never `mechanisms`; confirmed same user/roles with different `mechanisms` on each side reports as matching. |
 | 7 | Cluster-wide default read/write concern never checked | Confirmed blind spot (section 8.4) | **Yes** — no code anywhere calls `getDefaultRWConcern`; confirmed a real, version-driven durability-semantics difference (4.4 vs 8.0 implicit write concern) produces no diff. |
-| 8 | FCV never read or compared | Confirmed blind spot (section 8.5) | **Yes** — cheap addition (`getParameter: featureCompatibilityVersion`), informational line in the Phase 1 report would cover it; not yet implemented. |
 
 Items 3 and 4 are the two that are genuinely "cannot verify," not just
 "didn't get to it" — worth reading in full if evaluating whether to rely on
-this tool for a migration that uses either feature. Items 5-8 were found and
-confirmed live in section 8 (cross-version testing) — all fixable, none
-fixed yet; see that section for the evidence behind each. Two related and
-more severe blind spots found in the same pass (collection/index options
-using a fixed field allowlist that skipped asymmetric diffs, and the `_id_`
-index being unconditionally skipped) were fixed immediately rather than
-listed here - see section 8.3.
+this tool for a migration that uses either feature. Items 5-7 were found
+and confirmed live in section 8 (cross-version testing) — all fixable, none
+fixed yet; see that section for the evidence behind each.
+
+Six related and more severe gaps found across sections 8.3 and 9 were fixed
+immediately rather than left listed here: collection/index options using a
+fixed field allowlist that skipped asymmetric diffs, the `_id_` index being
+unconditionally skipped (8.3); GridFS content verification being dead code,
+the checkpoint file being global instead of job-scoped, custom role
+inheritance never being compared, replica set member topology never being
+compared, and FCV never being read (all section 9).
 
 1. **Sharded clusters** (mongos + config servers) were never tested — every
    scenario in this document ran against replica sets. `verify.sharding`

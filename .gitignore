@@ -1,5 +1,5 @@
 /mongogate
-checkpoints.json
+checkpoints*.json
 verify_report_*.json
 diff_*.csv
 *.log

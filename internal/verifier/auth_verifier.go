@@ -42,19 +42,24 @@ func VerifyAuth(ctx context.Context, src, tgt *mongo.Client, rpt *report.Report)
 		}
 	}
 
-	// ── Custom Roles (name + actual privilege content, not just existence) ──
+	// ── Custom Roles (name + actual privilege content + inherited roles, not just existence) ──
 	srcRoles, _ := getRoles(ctx, src)
 	tgtRoles, _ := getRoles(ctx, tgt)
-	for role, srcPriv := range srcRoles {
-		tgtPriv, ok := tgtRoles[role]
+	for role, srcInfo := range srcRoles {
+		tgtInfo, ok := tgtRoles[role]
 		if !ok {
 			errors = append(errors, fmt.Sprintf("❌ Missing role: %s", role))
 			continue
 		}
-		if srcPriv != tgtPriv {
+		if srcInfo.Privileges != tgtInfo.Privileges {
 			errors = append(errors,
 				fmt.Sprintf("⚠️  Role [%s] has different privileges\n     src=%s\n     tgt=%s",
-					role, srcPriv, tgtPriv))
+					role, srcInfo.Privileges, tgtInfo.Privileges))
+		}
+		if srcInfo.InheritedRoles != tgtInfo.InheritedRoles {
+			errors = append(errors,
+				fmt.Sprintf("⚠️  Role [%s] has different inherited roles\n     src=%s\n     tgt=%s",
+					role, srcInfo.InheritedRoles, tgtInfo.InheritedRoles))
 		}
 	}
 	for role := range tgtRoles {
@@ -106,24 +111,56 @@ func getUsers(ctx context.Context, client *mongo.Client) (map[string][]string, e
 	return users, nil
 }
 
-// getRoles returns each custom role mapped to a normalized, sorted string of
-// its privileges, so two roles sharing a name can be compared for actual
-// permission content, not just existence.
-func getRoles(ctx context.Context, client *mongo.Client) (map[string]string, error) {
+// roleInfo holds a custom role's directly-granted privileges and its
+// inherited sub-role list, normalized for equality comparison.
+type roleInfo struct {
+	Privileges     string
+	InheritedRoles string
+}
+
+// getRoles returns each custom role mapped to its normalized privilege and
+// inherited-role content, so two roles sharing a name can be compared for
+// actual permission content (including what they inherit), not just
+// existence.
+func getRoles(ctx context.Context, client *mongo.Client) (map[string]roleInfo, error) {
 	result := client.Database("admin").RunCommand(ctx,
 		bson.D{{Key: "rolesInfo", Value: 1}, {Key: "showPrivileges", Value: true}})
 	var res bson.M
 	if err := result.Decode(&res); err != nil {
 		return nil, err
 	}
-	roles := make(map[string]string)
+	roles := make(map[string]roleInfo)
 	arr, _ := res["roles"].(bson.A)
 	for _, r := range arr {
 		rm, _ := r.(bson.M)
 		name, _ := rm["role"].(string)
-		roles[name] = normalizePrivileges(rm["privileges"])
+		roles[name] = roleInfo{
+			Privileges:     normalizePrivileges(rm["privileges"]),
+			InheritedRoles: normalizeInheritedRoles(rm["roles"]),
+		}
 	}
 	return roles, nil
+}
+
+// normalizeInheritedRoles renders a role's sub-role (inheritance) list as a
+// sorted, stable string for simple equality comparison - same idea as
+// normalizePrivileges, but for the "roles: [...]" field rolesInfo also
+// returns, which getRoles previously never looked at.
+func normalizeInheritedRoles(rolesField interface{}) string {
+	arr, ok := rolesField.(bson.A)
+	if !ok {
+		return ""
+	}
+	var entries []string
+	for _, r := range arr {
+		rm, ok := r.(bson.M)
+		if !ok {
+			continue
+		}
+		entries = append(entries, fmt.Sprintf("%v@%v", rm["role"], rm["db"]))
+	}
+	sort.Strings(entries)
+	return strings.Join(entries, ",")
 }
 
 // normalizePrivileges renders a role's privilege list as a sorted, stable
