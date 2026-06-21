@@ -59,7 +59,7 @@ func TestDocHash_DatetimeUTC(t *testing.T) {
 // ── Float precision ──
 
 func TestDocHash_FloatPrecision(t *testing.T) {
-	doc1 := bson.M{"price": float64(0.1 + 0.2)}           // 0.30000000000000004
+	doc1 := bson.M{"price": float64(0.1 + 0.2)} // 0.30000000000000004
 	doc2 := bson.M{"price": float64(0.3)}
 	// After fixing precision to 10 decimal places these should match.
 	if utils.DocHash(doc1, opts) != utils.DocHash(doc2, opts) {
@@ -145,50 +145,72 @@ func TestDeepCompare_MissingField(t *testing.T) {
 	src := bson.M{"a": int32(1), "b": int32(2)}
 	tgt := bson.M{"a": int32(1)}
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Error("a missing field should fail") }
+	if passed {
+		t.Error("a missing field should fail")
+	}
 	found := false
 	for _, d := range diffs {
 		if d.IssueType == "MISSING_FIELD" && d.Path == "b" {
 			found = true
 		}
 	}
-	if !found { t.Errorf("expected MISSING_FIELD for b, got: %v", diffs) }
+	if !found {
+		t.Errorf("expected MISSING_FIELD for b, got: %v", diffs)
+	}
 }
 
 func TestDeepCompare_TypeMismatch(t *testing.T) {
 	src := bson.M{"x": int32(1)}
 	tgt := bson.M{"x": int64(1)}
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Error("a type mismatch should fail") }
+	if passed {
+		t.Error("a type mismatch should fail")
+	}
 	found := false
 	for _, d := range diffs {
-		if d.IssueType == "TYPE_MISMATCH" { found = true }
+		if d.IssueType == "TYPE_MISMATCH" {
+			found = true
+		}
 	}
-	if !found { t.Errorf("expected TYPE_MISMATCH, got: %v", diffs) }
+	if !found {
+		t.Errorf("expected TYPE_MISMATCH, got: %v", diffs)
+	}
 }
 
 func TestDeepCompare_ExtraField(t *testing.T) {
 	src := bson.M{"a": int32(1)}
 	tgt := bson.M{"a": int32(1), "extra": "surprise"}
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Error("an extra field in target should fail") }
+	if passed {
+		t.Error("an extra field in target should fail")
+	}
 	found := false
 	for _, d := range diffs {
-		if d.IssueType == "EXTRA_FIELD" && d.Path == "extra" { found = true }
+		if d.IssueType == "EXTRA_FIELD" && d.Path == "extra" {
+			found = true
+		}
 	}
-	if !found { t.Errorf("expected EXTRA_FIELD for extra, got: %v", diffs) }
+	if !found {
+		t.Errorf("expected EXTRA_FIELD for extra, got: %v", diffs)
+	}
 }
 
 func TestDeepCompare_NestedDoc(t *testing.T) {
 	src := bson.M{"addr": bson.M{"city": "Taipei", "zip": "100"}}
 	tgt := bson.M{"addr": bson.M{"city": "Taipei", "zip": "200"}}
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Error("a nested field diff should fail") }
+	if passed {
+		t.Error("a nested field diff should fail")
+	}
 	found := false
 	for _, d := range diffs {
-		if d.Path == "addr.zip" { found = true }
+		if d.Path == "addr.zip" {
+			found = true
+		}
 	}
-	if !found { t.Errorf("expected a diff at addr.zip, got: %v", diffs) }
+	if !found {
+		t.Errorf("expected a diff at addr.zip, got: %v", diffs)
+	}
 }
 
 func TestDeepCompare_Identical(t *testing.T) {
@@ -198,7 +220,9 @@ func TestDeepCompare_Identical(t *testing.T) {
 		"tags":  primitive.A{"x", "y"},
 	}
 	passed, diffs := utils.DeepCompare(doc, doc, opts)
-	if !passed { t.Errorf("identical documents should pass, diffs: %v", diffs) }
+	if !passed {
+		t.Errorf("identical documents should pass, diffs: %v", diffs)
+	}
 }
 
 // ── truncate() must not split a multi-byte UTF-8 character ──
@@ -211,8 +235,12 @@ func TestDeepCompare_TruncateMultibyteSafe(t *testing.T) {
 	tgt := bson.M{"val": longStr + "X"} // force a VALUE_DIFF so it goes through truncate()
 
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Fatal("expected a diff") }
-	if len(diffs) == 0 { t.Fatal("expected at least one diff") }
+	if passed {
+		t.Fatal("expected a diff")
+	}
+	if len(diffs) == 0 {
+		t.Fatal("expected at least one diff")
+	}
 	for _, d := range diffs {
 		if !utf8.ValidString(d.SrcValue) {
 			t.Errorf("SrcValue is not valid UTF-8 after truncation: %q", d.SrcValue)
@@ -248,22 +276,34 @@ func TestDeepCompare_ArrayOfDocsElementDiff(t *testing.T) {
 		bson.M{"name": "b", "qty": int32(99)},
 	}}
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Fatal("expected a diff") }
+	if passed {
+		t.Fatal("expected a diff")
+	}
 	found := false
 	for _, d := range diffs {
-		if d.Path == "items[1].qty" { found = true }
+		if d.Path == "items[1].qty" {
+			found = true
+		}
 	}
-	if !found { t.Errorf("expected a diff at items[1].qty, got: %v", diffs) }
+	if !found {
+		t.Errorf("expected a diff at items[1].qty, got: %v", diffs)
+	}
 }
 
 func TestDeepCompare_ArrayLengthMismatch(t *testing.T) {
 	src := bson.M{"items": primitive.A{bson.M{"name": "a"}, bson.M{"name": "b"}}}
 	tgt := bson.M{"items": primitive.A{bson.M{"name": "a"}}}
 	passed, diffs := utils.DeepCompare(src, tgt, opts)
-	if passed { t.Fatal("expected a diff") }
+	if passed {
+		t.Fatal("expected a diff")
+	}
 	found := false
 	for _, d := range diffs {
-		if d.IssueType == "ARRAY_LENGTH_MISMATCH" && d.Path == "items" { found = true }
+		if d.IssueType == "ARRAY_LENGTH_MISMATCH" && d.Path == "items" {
+			found = true
+		}
 	}
-	if !found { t.Errorf("expected ARRAY_LENGTH_MISMATCH at items, got: %v", diffs) }
+	if !found {
+		t.Errorf("expected ARRAY_LENGTH_MISMATCH at items, got: %v", diffs)
+	}
 }

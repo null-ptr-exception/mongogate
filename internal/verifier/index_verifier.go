@@ -40,7 +40,9 @@ func VerifyIndexes(ctx context.Context, src, tgt *mongo.Client,
 	rpt.SetIndex(ns, res)
 	if !res.Passed {
 		fmt.Printf("  ❌ Index [%s]\n", ns)
-		for _, e := range errors { fmt.Printf("     %s\n", e) }
+		for _, e := range errors {
+			fmt.Printf("     %s\n", e)
+		}
 	}
 }
 
@@ -52,14 +54,14 @@ func compareIndex(name string, si, ti bson.M) []string {
 		"clustered",
 		"sparse",
 		"hidden",
-		"expireAfterSeconds",    // TTL
+		"expireAfterSeconds",      // TTL
 		"partialFilterExpression", // Partial
-		"weights",               // Text index
+		"weights",                 // Text index
 		"collation",
-		"wildcardProjection",    // Wildcard
-		"2dsphereIndexVersion",  // Geo
-		"default_language",      // Text
-		"language_override",     // Text
+		"wildcardProjection",   // Wildcard
+		"2dsphereIndexVersion", // Geo
+		"default_language",     // Text
+		"language_override",    // Text
 	}
 	return compareBSONFields(fmt.Sprintf("Index [%s]", name), fields, si, ti)
 }
@@ -68,7 +70,9 @@ func getIndexes(ctx context.Context, client *mongo.Client,
 	dbName, colName string) map[string]bson.M {
 
 	cur, err := client.Database(dbName).Collection(colName).Indexes().List(ctx)
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer cur.Close(ctx)
 	result := make(map[string]bson.M)
 	for cur.Next(ctx) {

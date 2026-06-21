@@ -99,8 +99,8 @@ func seedBaselineOn(ctx context.Context, cli *mongo.Client, dbName string) {
 	var docs []interface{}
 	for i := 0; i < 20; i++ {
 		docs = append(docs, bson.M{
-			"_id": fmt.Sprintf("plain-%03d", i),
-			"name": fmt.Sprintf("item-%d", i),
+			"_id":   fmt.Sprintf("plain-%03d", i),
+			"name":  fmt.Sprintf("item-%d", i),
 			"count": int32(i),
 			"price": float64(i) + 0.5,
 		})

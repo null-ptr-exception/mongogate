@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	monitorDB      = "migration_monitor"
-	metricsCol     = "verify_metrics"
-	eventsCol      = "verify_events"
-	ttlSeconds     = 60 * 60 * 24 * 7 // 7 days
+	monitorDB  = "migration_monitor"
+	metricsCol = "verify_metrics"
+	eventsCol  = "verify_events"
+	ttlSeconds = 60 * 60 * 24 * 7 // 7 days
 )
 
 type MetricsWriter struct {
@@ -23,20 +23,20 @@ type MetricsWriter struct {
 }
 
 type Metric struct {
-	Timestamp    time.Time   `bson:"timestamp"`
-	Metadata     bson.M      `bson:"metadata"`
-	NS           string      `bson:"ns"`
-	Phase        string      `bson:"phase"`
-	Processed    int64       `bson:"processed_docs"`
-	Total        int64       `bson:"total_docs"`
-	ProgressPct  float64     `bson:"progress_pct"`
-	Missing      int         `bson:"missing_count"`
-	Different    int         `bson:"different_count"`
-	SrcCount     int64       `bson:"src_count"`
-	TgtCount     int64       `bson:"tgt_count"`
-	CountDiff    int64       `bson:"count_diff"`
-	IsExact      bool        `bson:"is_exact"`
-	DurationSecs float64     `bson:"duration_seconds"`
+	Timestamp    time.Time `bson:"timestamp"`
+	Metadata     bson.M    `bson:"metadata"`
+	NS           string    `bson:"ns"`
+	Phase        string    `bson:"phase"`
+	Processed    int64     `bson:"processed_docs"`
+	Total        int64     `bson:"total_docs"`
+	ProgressPct  float64   `bson:"progress_pct"`
+	Missing      int       `bson:"missing_count"`
+	Different    int       `bson:"different_count"`
+	SrcCount     int64     `bson:"src_count"`
+	TgtCount     int64     `bson:"tgt_count"`
+	CountDiff    int64     `bson:"count_diff"`
+	IsExact      bool      `bson:"is_exact"`
+	DurationSecs float64   `bson:"duration_seconds"`
 }
 
 type Event struct {
@@ -55,8 +55,12 @@ func NewMetricsWriter(client *mongo.Client) (*MetricsWriter, error) {
 	hasMetrics := false
 	hasEvents := false
 	for _, n := range colNames {
-		if n == metricsCol { hasMetrics = true }
-		if n == eventsCol  { hasEvents = true }
+		if n == metricsCol {
+			hasMetrics = true
+		}
+		if n == eventsCol {
+			hasEvents = true
+		}
 	}
 
 	if !hasMetrics {
@@ -90,7 +94,9 @@ func NewMetricsWriter(client *mongo.Client) (*MetricsWriter, error) {
 }
 
 func (w *MetricsWriter) Write(m Metric) {
-	if w == nil { return }
+	if w == nil {
+		return
+	}
 	m.Timestamp = time.Now().UTC()
 	if m.Metadata == nil {
 		m.Metadata = bson.M{"job": "migration_verify"}
@@ -103,7 +109,9 @@ func (w *MetricsWriter) Write(m Metric) {
 }
 
 func (w *MetricsWriter) LogEvent(jobID, level, message string) {
-	if w == nil { return }
+	if w == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	e := Event{

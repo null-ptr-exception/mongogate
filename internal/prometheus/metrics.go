@@ -59,7 +59,9 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	for ns, data := range m.rpt.GetData() {
 		label := sanitizeLabel(ns)
 		passed := 0.0
-		if data.Passed { passed = 1.0 }
+		if data.Passed {
+			passed = 1.0
+		}
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_passed{ns="%s"} %g`+"\n", label, passed))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_missing{ns="%s"} %d`+"\n", label, data.MissingCount))
 		sb.WriteString(fmt.Sprintf(`mongogate_ns_different{ns="%s"} %d`+"\n", label, data.DifferentCount))
@@ -71,7 +73,9 @@ func (m *MetricsServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Overall
 	allPassed := 0.0
-	if m.rpt.AllPassed() { allPassed = 1.0 }
+	if m.rpt.AllPassed() {
+		allPassed = 1.0
+	}
 	sb.WriteString(fmt.Sprintf("mongogate_all_passed %g\n", allPassed))
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")

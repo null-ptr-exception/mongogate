@@ -115,7 +115,9 @@ func getGridFSFiles(ctx context.Context, client *mongo.Client,
 
 	cur, err := client.Database(dbName).Collection("fs.files").
 		Find(ctx, bson.M{})
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer cur.Close(ctx)
 
 	files := make(map[string]bson.M)

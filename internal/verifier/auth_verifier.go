@@ -139,9 +139,14 @@ func getUsers(ctx context.Context, client *mongo.Client) (map[string]userInfo, e
 		um, _ := u.(bson.M)
 		username, _ := um["user"].(string)
 		var roles []string
-		for _, r := range um["roles"].(bson.A) {
-			rm := r.(bson.M)
-			roles = append(roles, fmt.Sprintf("%s@%s", rm["role"], rm["db"]))
+		if rarr, ok := um["roles"].(bson.A); ok {
+			for _, r := range rarr {
+				rm, ok := r.(bson.M)
+				if !ok {
+					continue
+				}
+				roles = append(roles, fmt.Sprintf("%s@%s", rm["role"], rm["db"]))
+			}
 		}
 		sort.Strings(roles)
 		var mechs []string

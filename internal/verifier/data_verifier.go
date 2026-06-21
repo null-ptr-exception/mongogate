@@ -46,8 +46,12 @@ func VerifyAllData(
 	rpt *report.Report,
 ) {
 	fmt.Printf("\n📊 [%s] Data verification (%d workers)", opts.Phase, opts.MaxWorkers)
-	if opts.DryRun        { fmt.Printf(" [DRY-RUN]") }
-	if opts.Bidirectional { fmt.Printf(" [bidirectional]") }
+	if opts.DryRun {
+		fmt.Printf(" [DRY-RUN]")
+	}
+	if opts.Bidirectional {
+		fmt.Printf(" [bidirectional]")
+	}
 	fmt.Println()
 
 	taskCh := make(chan CollectionTask, len(collections))
@@ -65,7 +69,9 @@ func VerifyAllData(
 				result := verifyOneCollection(ctx, src, tgt, task, opts, mw, am, pm, rpt)
 				rpt.SetData(result.NS, result)
 				status := "✅"
-				if !result.Passed { status = "❌" }
+				if !result.Passed {
+					status = "❌"
+				}
 				fmt.Printf("  %s %-45s src=%-8d missing=%-5d diff=%-5d extra_in_target=%-5d\n",
 					status, result.NS, result.SrcCount,
 					result.MissingCount, result.DifferentCount, result.ExtraInTarget)
@@ -160,7 +166,9 @@ func processSrcToTgt(
 
 	if opts.SampleRate > 0 && opts.SampleRate < 1 {
 		sampleSize := int64(float64(total) * opts.SampleRate)
-		if sampleSize < 1 { sampleSize = 1 }
+		if sampleSize < 1 {
+			sampleSize = 1
+		}
 		cur, err = srcCol.Aggregate(ctx, mongo.Pipeline{
 			{{Key: "$sample", Value: bson.M{"size": sampleSize}}},
 		})
@@ -176,7 +184,9 @@ func processSrcToTgt(
 	var processed int64
 	for cur.Next(ctx) {
 		var srcDoc bson.M
-		if err := cur.Decode(&srcDoc); err != nil { continue }
+		if err := cur.Decode(&srcDoc); err != nil {
+			continue
+		}
 		docID := srcDoc["_id"]
 
 		var tgtDoc bson.M
@@ -224,8 +234,8 @@ func processSrcToTgt(
 				Processed: processed, Total: total, ProgressPct: pct,
 				Missing: result.MissingCount, Different: result.DifferentCount,
 				SrcCount: result.SrcCount, TgtCount: result.TgtCount,
-				CountDiff: result.SrcCount - result.TgtCount,
-				IsExact: opts.SampleRate == 0,
+				CountDiff:    result.SrcCount - result.TgtCount,
+				IsExact:      opts.SampleRate == 0,
 				DurationSecs: time.Since(startTime).Seconds(),
 			})
 
@@ -258,12 +268,16 @@ func processTgtToSrc(
 			SetSort(bson.D{{Key: "_id", Value: 1}}).
 			SetBatchSize(int32(opts.BatchSize)).
 			SetProjection(bson.M{"_id": 1})) // only pull _id to save bandwidth
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer cur.Close(ctx)
 
 	for cur.Next(ctx) {
 		var doc bson.M
-		if err := cur.Decode(&doc); err != nil { continue }
+		if err := cur.Decode(&doc); err != nil {
+			continue
+		}
 		docID := doc["_id"]
 
 		var srcDoc bson.M
@@ -283,7 +297,9 @@ func processTgtToSrc(
 func countWithRetry(ctx context.Context, col *mongo.Collection, opts DataVerifyOptions) int64 {
 	for i := 0; i <= opts.RetryCount; i++ {
 		n, err := col.CountDocuments(ctx, bson.M{})
-		if err == nil { return n }
+		if err == nil {
+			return n
+		}
 		if i < opts.RetryCount {
 			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
 		}
@@ -299,7 +315,9 @@ func findWithRetry(ctx context.Context, col *mongo.Collection,
 			time.Duration(opts.TimeoutSecs)*time.Second)
 		err := col.FindOne(tCtx, bson.M{"_id": docID}).Decode(result)
 		cancel()
-		if err == nil { return nil }
+		if err == nil {
+			return nil
+		}
 		if i < opts.RetryCount {
 			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
 		}

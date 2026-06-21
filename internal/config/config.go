@@ -18,14 +18,14 @@ type HashOptions struct {
 }
 
 type AlertConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	SlackWebhook   string `yaml:"slack_webhook"`
-	EmailSMTP      string `yaml:"email_smtp"`
-	EmailFrom      string `yaml:"email_from"`
-	EmailTo        []string `yaml:"email_to"`
-	MissingThreshold   int `yaml:"missing_threshold"`    // fires when missing > N
-	DifferentThreshold int `yaml:"different_threshold"`  // fires when different > N
-	StuckMinutes       int `yaml:"stuck_minutes"`        // fires when progress hasn't moved in N minutes
+	Enabled            bool     `yaml:"enabled"`
+	SlackWebhook       string   `yaml:"slack_webhook"`
+	EmailSMTP          string   `yaml:"email_smtp"`
+	EmailFrom          string   `yaml:"email_from"`
+	EmailTo            []string `yaml:"email_to"`
+	MissingThreshold   int      `yaml:"missing_threshold"`   // fires when missing > N
+	DifferentThreshold int      `yaml:"different_threshold"` // fires when different > N
+	StuckMinutes       int      `yaml:"stuck_minutes"`       // fires when progress hasn't moved in N minutes
 }
 
 type Config struct {
@@ -40,23 +40,23 @@ type Config struct {
 	RetryCount  int `yaml:"retry_count"`
 	RetryWaitMS int `yaml:"retry_wait_ms"`
 
-	SkipDBs    []string `yaml:"skip_dbs"`
-	IncludeNS  []string `yaml:"include_ns"`  // format: "db.col" or "db.*"
-	ExcludeNS  []string `yaml:"exclude_ns"`
+	SkipDBs   []string `yaml:"skip_dbs"`
+	IncludeNS []string `yaml:"include_ns"` // format: "db.col" or "db.*"
+	ExcludeNS []string `yaml:"exclude_ns"`
 
 	// Queryable Encryption has no toggle here on purpose: it's not a
 	// missing feature, it's a ceiling on what hash-based comparison can
 	// ever tell you about encrypted data (see docs/TESTING.md "Known
 	// limitations") - a flag that did nothing would just be misleading.
 	Verify struct {
-		Auth     bool `yaml:"auth"`
-		Cluster  bool `yaml:"cluster"`
-		Schema   bool `yaml:"schema"`
-		Index    bool `yaml:"index"`
-		Data     bool `yaml:"data"`
-		GridFS   bool `yaml:"gridfs"`
-		Sharding bool `yaml:"sharding"`
-		Views    bool `yaml:"views"`
+		Auth          bool `yaml:"auth"`
+		Cluster       bool `yaml:"cluster"`
+		Schema        bool `yaml:"schema"`
+		Index         bool `yaml:"index"`
+		Data          bool `yaml:"data"`
+		GridFS        bool `yaml:"gridfs"`
+		Sharding      bool `yaml:"sharding"`
+		Views         bool `yaml:"views"`
 		Bidirectional bool `yaml:"bidirectional"` // also scan target → source
 	} `yaml:"verify"`
 
@@ -67,8 +67,8 @@ type Config struct {
 	Alert       AlertConfig `yaml:"alert"`
 
 	// Execution mode
-	DryRun    bool   `yaml:"dry_run"`
-	AutoRepair bool  `yaml:"auto_repair"`  // automatically repair diffs found
+	DryRun     bool   `yaml:"dry_run"`
+	AutoRepair bool   `yaml:"auto_repair"` // automatically repair diffs found
 	ExportCSV  string `yaml:"export_csv"`  // diff export path
 
 	// HTTP API
@@ -107,17 +107,17 @@ func defaults() *Config {
 		// guarantees false positives - SCRAM credentials are freshly salted
 		// per createUser call, so the same password produces different
 		// stored bytes on each side even on a 100% correct migration.
-		SkipDBs:                   []string{"local", "config", "admin"},
-		HTTPPort:                  0,
-		PrometheusPort:            0,
+		SkipDBs:        []string{"local", "config", "admin"},
+		HTTPPort:       0,
+		PrometheusPort: 0,
 	}
-	cfg.Verify.Auth      = true
-	cfg.Verify.Cluster   = true
-	cfg.Verify.Schema    = true
-	cfg.Verify.Index     = true
-	cfg.Verify.Data      = true
-	cfg.Verify.GridFS    = true
-	cfg.Verify.Views     = true
+	cfg.Verify.Auth = true
+	cfg.Verify.Cluster = true
+	cfg.Verify.Schema = true
+	cfg.Verify.Index = true
+	cfg.Verify.Data = true
+	cfg.Verify.GridFS = true
+	cfg.Verify.Views = true
 	cfg.Verify.Bidirectional = true
 	cfg.HashOptions = HashOptions{
 		NormalizeDatetime:       true,
@@ -136,9 +136,15 @@ func defaults() *Config {
 }
 
 func validate(cfg *Config) error {
-	if cfg.SourceURI == "" { return fmt.Errorf("source_uri is required") }
-	if cfg.TargetURI == "" { return fmt.Errorf("target_uri is required") }
-	if cfg.MonitorURI == "" { return fmt.Errorf("monitor_uri is required") }
+	if cfg.SourceURI == "" {
+		return fmt.Errorf("source_uri is required")
+	}
+	if cfg.TargetURI == "" {
+		return fmt.Errorf("target_uri is required")
+	}
+	if cfg.MonitorURI == "" {
+		return fmt.Errorf("monitor_uri is required")
+	}
 	if cfg.BatchSize < 1 || cfg.BatchSize > 10000 {
 		return fmt.Errorf("batch_size must be between 1 and 10000")
 	}
@@ -176,7 +182,9 @@ checkExclude:
 }
 
 func matchNS(pattern, ns, dbName string) bool {
-	if pattern == ns { return true }
+	if pattern == ns {
+		return true
+	}
 	// "db.*" matches every collection in that db
 	if strings.HasSuffix(pattern, ".*") {
 		prefix := strings.TrimSuffix(pattern, ".*")

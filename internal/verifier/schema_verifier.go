@@ -114,7 +114,9 @@ func getCollectionOptions(ctx context.Context, client *mongo.Client,
 
 	cur, err := client.Database(dbName).ListCollections(ctx,
 		bson.M{"name": colName})
-	if err != nil { return bson.M{} }
+	if err != nil {
+		return bson.M{}
+	}
 	defer cur.Close(ctx)
 	if cur.Next(ctx) {
 		var doc bson.M
@@ -149,7 +151,9 @@ func listCollections(ctx context.Context, client *mongo.Client, dbName string) [
 
 func toSet(ss []string) map[string]bool {
 	m := make(map[string]bool, len(ss))
-	for _, s := range ss { m[s] = true }
+	for _, s := range ss {
+		m[s] = true
+	}
 	return m
 }
 
@@ -165,7 +169,9 @@ func filterStrings(ss []string, keep func(string) bool) []string {
 
 func printStatus(label string, passed bool, detail string) {
 	status := "✅ PASS"
-	if !passed { status = "❌ FAIL" }
+	if !passed {
+		status = "❌ FAIL"
+	}
 	if detail != "" {
 		fmt.Printf("  %s %s (%s)\n", status, label, detail)
 	} else {

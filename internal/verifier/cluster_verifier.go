@@ -153,16 +153,22 @@ func getServerParam(ctx context.Context, client *mongo.Client, param string) str
 	result := client.Database("admin").RunCommand(ctx,
 		bson.D{{Key: "getParameter", Value: 1}, {Key: param, Value: 1}})
 	var res bson.M
-	if err := result.Decode(&res); err != nil { return "" }
+	if err := result.Decode(&res); err != nil {
+		return ""
+	}
 	return fmt.Sprintf("%v", res[param])
 }
 
 func countShards(ctx context.Context, client *mongo.Client) int {
 	cur, err := client.Database("config").Collection("shards").Find(ctx, bson.M{})
-	if err != nil { return 0 }
+	if err != nil {
+		return 0
+	}
 	defer cur.Close(ctx)
 	count := 0
-	for cur.Next(ctx) { count++ }
+	for cur.Next(ctx) {
+		count++
+	}
 	return count
 }
 
@@ -181,7 +187,9 @@ func verifyShardKeys(ctx context.Context, src, tgt *mongo.Client) []string {
 
 func getShardKeys(ctx context.Context, client *mongo.Client) map[string]string {
 	cur, err := client.Database("config").Collection("collections").Find(ctx, bson.M{})
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer cur.Close(ctx)
 	keys := make(map[string]string)
 	for cur.Next(ctx) {
@@ -246,10 +254,14 @@ func getMemberDelaySecs(mm bson.M) int32 {
 }
 
 func getInt32(m bson.M, key string) int32 {
-	if v, ok := m[key].(int32); ok { return v }
+	if v, ok := m[key].(int32); ok {
+		return v
+	}
 	return 0
 }
 func getBool(m bson.M, key string) bool {
-	if v, ok := m[key].(bool); ok { return v }
+	if v, ok := m[key].(bool); ok {
+		return v
+	}
 	return false
 }
