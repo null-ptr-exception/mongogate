@@ -31,10 +31,10 @@ func main() {
 	phase := flag.String("phase", "all", "1, 2, 3, or all")
 	resume := flag.Bool("resume", false, "resume a Phase 3 run from checkpoint")
 	dryRun := flag.Bool("dry-run", false, "scan without comparing (connectivity/counts only)")
-	sample := flag.Float64("sample", -1, "override sample_rate (0-1)")
+	sample := flag.Float64("sample", -1, "override sample_rate (0-1) for Phase 2; Phase 3 always does a full, unsampled scan")
 	includeNS := flag.String("include-ns", "", "single namespace to include (db.col or db.*)")
 	excludeNS := flag.String("exclude-ns", "", "single namespace to exclude")
-	autoRepair := flag.Bool("auto-repair", false, "automatically copy diffs from source to target")
+	autoRepair := flag.Bool("auto-repair", false, "after Phase 3, write its diffs (missing/different docs) from source to target - mutates the target cluster")
 	exportCSV := flag.String("export-csv", "", "path to export diff CSV (or 'auto')")
 	flag.Parse()
 

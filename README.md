@@ -333,6 +333,28 @@ reasoning behind the performance-related ones.
 ./mongogate --dry-run --phase all
 ```
 
+### Auto-repair
+
+`--auto-repair` **writes to the target cluster** — after Phase 3 runs, it
+copies the diffs it found (missing/different documents, capped at 50
+sampled docs per type) from source to target. Run a plain `--phase 3`
+first and read the report; only add `--auto-repair` once you've confirmed
+the diffs it would copy are genuinely missing data, not a symptom of
+something else (e.g. a bug feeding the migration, or a structural drift
+Phase 1 should have caught first).
+
+```bash
+# 1. Review first
+./mongogate --phase 3
+
+# 2. Only then, if the diffs above are what you expect
+./mongogate --phase 3 --auto-repair
+```
+
+Note also: `--sample` only affects Phase 2. Phase 3 always does a full,
+unsampled scan regardless of `--sample` or `sample_rate` in config.yaml —
+that's what makes it the cutover gate.
+
 ## Scoping a run to one database or collection
 
 `--include-ns` / `--exclude-ns` (or the `include_ns` / `exclude_ns` lists in

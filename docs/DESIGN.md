@@ -892,11 +892,11 @@ mydb.orders, VALUE_DIFF, 64a1b2c4..., price, float64, float64, f:99.9000000000, 
 | `--phase` | 1 / 2 / 3 / all | all |
 | `--resume` | resume from checkpoint | false |
 | `--config` | path to config file | config.yaml |
-| `--sample` | sample rate (0.1=10%) | 0 (full scan) |
+| `--sample` | override `sample_rate` (0-1) for Phase 2; **ignored by Phase 3**, which always does a full, unsampled scan | -1 (use config's `sample_rate`) |
 | `--dry-run` | scan only, no comparison | false |
 | `--include-ns` | only verify this NS | (all) |
 | `--exclude-ns` | exclude this NS | (none) |
-| `--auto-repair` | copy missing/different docs from source to target after the run | false |
+| `--auto-repair` | after Phase 3, copy its diffs (missing/different docs) from source to target — **writes to the target cluster** | false |
 | `--export-csv` | export every diff to a CSV file (path, or `auto` for a timestamped name) | (disabled) |
 
 ### Namespace filter syntax
