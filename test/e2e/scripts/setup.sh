@@ -135,6 +135,22 @@ setup_replica_set() {
     done
   done
 
+  # The per-member check above wasn't sufficient on its own - confirmed
+  # live, a CI run still hit AuthenticationFailed afterward. A direct
+  # `kubectl exec <pod> -- mongosh -u ... ` always happens to land on that
+  # exact pod; it doesn't exercise the same multi-host discovery/mechanism
+  # negotiation loadgen's driver does when given all three hosts in one
+  # connection string. Check that too, since that's what actually failed.
+  SEEDLIST="mongo-0.mongo-headless.$ns.svc.cluster.local:27017,mongo-1.mongo-headless.$ns.svc.cluster.local:27017,mongo-2.mongo-headless.$ns.svc.cluster.local:27017"
+  for i in $(seq 1 30); do
+    if kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet \
+         "mongodb://root:rootpass123@${SEEDLIST}/admin?replicaSet=rs0" \
+         --eval "1" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
   echo "==> [$ns] Replica set ready."
 }
 
