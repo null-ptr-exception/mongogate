@@ -856,10 +856,12 @@ compared, and FCV never being read (all section 9).
    a 100%-correct migration re-encrypts to different ciphertext bytes for the
    same plaintext. mongogate has no key material to decrypt and compare
    plaintext, so QE fields will report as different regardless of whether
-   the migration is correct. This isn't a missing feature to implement — the
-   `verify.encryption` config flag is already a confirmed no-op (declared in
-   `internal/config/config.go`, never read anywhere else) — it's a ceiling on
-   what hash-based comparison can ever tell you about encrypted data.
+   the migration is correct. This isn't a missing feature to implement — it's
+   a ceiling on what hash-based comparison can ever tell you about encrypted
+   data. The `verify.encryption` config flag used to exist as a confirmed
+   no-op (declared, never read anywhere); removed in this pass (`config.go`,
+   `config.yaml`) rather than left as a switch that looked like it did
+   something.
 
 ---
 

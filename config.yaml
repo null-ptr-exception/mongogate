@@ -23,6 +23,9 @@ skip_dbs:
 #   - mydb.logs
 
 # Verification switches
+# Queryable Encryption has no switch here on purpose - it's not a missing
+# feature, it's a ceiling on what hash-based comparison can ever tell you
+# about encrypted data. See docs/TESTING.md "Known limitations".
 verify:
   auth: true
   cluster: true
@@ -31,8 +34,7 @@ verify:
   data: true
   gridfs: true
   views: true
-  sharding: false
-  encryption: false
+  sharding: false        # turn on only if source/target are sharded clusters
   bidirectional: true   # also scan target → source (finds extra docs in target)
 
 phase2_lag_threshold_seconds: 10

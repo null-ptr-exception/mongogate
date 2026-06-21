@@ -6,6 +6,15 @@
 **Lines of code:** ~3,000
 **File count:** 21 (+ test/e2e tooling)
 
+This is the design specification - what the system is intended to do. For
+what has actually been confirmed against a real MongoDB cluster (including
+several places this document used to be wrong until this pass corrected
+them), see [`docs/TESTING.md`](TESTING.md). Notably: `cmd/mongogate` - the
+binary this whole document describes - did not exist as buildable code in
+any branch of this repository until `docs/TESTING.md` section 8 wrote it;
+no verification scenario described here had ever been run for real before
+that.
+
 ---
 
 ## Table of Contents
@@ -110,7 +119,10 @@ Hash carries hash_is_exact: true/false.
 ### Principle 4: Interruptible, resumable
 
 ```
-A checkpoint (checkpoints.json) is saved every 1,000 documents.
+A checkpoint is saved every 1,000 documents, to a filename derived from a
+hash of source_uri+target_uri (e.g. checkpoints_a1b2c3d4e5f6.json) rather
+than a fixed checkpoints.json - so two different migration jobs run from
+the same working directory don't clobber each other's resume state.
 If the process crashes mid-run, --resume picks up from the last checkpoint.
 No need to start over from scratch.
 ```
@@ -143,7 +155,7 @@ mongogate/
 │   │   ├── schema_verifier.go     # DB, collection, options, validator
 │   │   ├── index_verifier.go      # Every index type
 │   │   ├── view_verifier.go       # View definitions
-│   │   ├── gridfs_verifier.go     # GridFS metadata + MD5
+│   │   ├── gridfs_verifier.go     # GridFS metadata + content hash (SHA256)
 │   │   └── data_verifier.go       # Document count + hash, multi-threaded
 │   ├── utils/
 │   │   ├── hasher.go              # SHA256 hash + normalization + DeepCompare
@@ -259,7 +271,7 @@ starts      sync done       < 10s           write-stop
 - Collection list, options, validator, collation, time series, TTL, capped
 - Every index type
 - View definitions
-- GridFS metadata (excluding MD5)
+- GridFS metadata (excluding content hash)
 
 **Typical duration:** 1–5 minutes
 
@@ -279,7 +291,8 @@ confirming the migration is broadly on track.
 - Full hash comparison (with all 6 normalization rules)
 - Field-level DeepCompare diffs
 - Bidirectional comparison (finds documents that only exist in target)
-- GridFS content MD5
+- GridFS content hash (SHA256, streamed via the GridFS download API - see
+  docs/TESTING.md section 9.1 for why this isn't MD5)
 
 **This is the final gate — only proceed to cutover once this passes.**
 
@@ -293,8 +306,8 @@ confirming the migration is broadly on track.
 |------|-------------|-------|
 | Users | Account list, password hashes (not compared directly) | 1 |
 | Roles | Each user's role list | 1 |
-| Custom roles | Custom role definitions | 1 |
-| Auth mechanism | SCRAM-SHA-256, etc. | 1 |
+| Custom roles | Custom role definitions, including inherited sub-roles | 1 |
+| Auth mechanism | Server-wide enabled mechanism list (`authenticationMechanisms`) only - **not** checked per-user (a user could be SCRAM on one side, x.509 on the other, with identical roles, and this would not catch it; see docs/TESTING.md "Known limitations") | 1 |
 | LDAP servers | LDAP server settings | 1 |
 
 ### Cluster layer
@@ -303,10 +316,17 @@ confirming the migration is broadly on track.
 |------|-------------|-------|
 | Replica set protocolVersion | RS protocol version | 1 |
 | writeConcernMajorityJournalDefault | Write-acknowledgment setting | 1 |
+| Replica set topology | Aggregate member count, arbiter count, voting member count, hidden/delayed secondary count (not per-host identity - hostnames always differ between source and target) | 1 |
 | slowOpThresholdMs | Slow-query threshold | 1 |
 | maxIncomingConnections | Max connection count | 1 |
 | Shard count | (requires verify.sharding) | 1 |
 | Shard key | Per-collection shard key | 1 |
+| Version / FCV | `buildInfo.version` and `featureCompatibilityVersion` on both sides - informational only, never affects pass/fail, printed in every report header so version-driven diffs elsewhere aren't a surprise | 1 |
+
+Not checked anywhere: cluster-wide default read/write concern
+(`getDefaultRWConcern`), and only 2 of MongoDB's hundreds of server
+parameters (`slowOpThresholdMs`, `maxIncomingConnections`) - see
+docs/TESTING.md "Known limitations".
 
 ### Database layer
 
@@ -362,7 +382,7 @@ confirming the migration is broadly on track.
 | File count | | 1 |
 | filename | | 1 |
 | length | File size | 1 |
-| md5 | Content MD5 (Phase 3 only) | 3 |
+| content hash | SHA256 over the actual file bytes, streamed via the GridFS download API - not the `fs.files.md5` field, which the driver stopped writing years ago (Phase 3 only) | 3 |
 
 ### Data layer
 
@@ -875,6 +895,8 @@ mydb.orders, VALUE_DIFF, 64a1b2c4..., price, float64, float64, f:99.9000000000, 
 | `--dry-run` | scan only, no comparison | false |
 | `--include-ns` | only verify this NS | (all) |
 | `--exclude-ns` | exclude this NS | (none) |
+| `--auto-repair` | copy missing/different docs from source to target after the run | false |
+| `--export-csv` | export every diff to a CSV file (path, or `auto` for a timestamped name) | (disabled) |
 
 ### Namespace filter syntax
 
@@ -893,7 +915,8 @@ and `config.NSFilter` in `internal/config/config.go`.
 ### Checkpoint/resume mechanism
 
 ```
-Every 1,000 documents, a checkpoint is saved to checkpoints.json:
+Every 1,000 documents, a checkpoint is saved to a job-scoped file
+(checkpoints_<hash of source_uri+target_uri>.json, internal/utils/checkpoint.go):
 {
   "mydb.users": "64a1b2c3d4e5f6a7b8c9d0e1",
   "mydb.orders": "64a1b2c3d4e5f6a7b8c9d0e2"
@@ -1042,7 +1065,7 @@ journalctl -u mongogate -f
 | 20 | Wildcard index | projection settings |
 | 21 | View definitions | viewOn, pipeline, collation |
 | 22 | GridFS metadata | count, filename, length |
-| 23 | GridFS MD5 | content integrity (Phase 3) |
+| 23 | GridFS content hash | SHA256 content integrity, streamed (Phase 3) |
 | 24 | Count comparison | tagged estimate/exact |
 | 25 | Hash comparison | full SHA256 |
 | 26 | Field type verification | BSON types |

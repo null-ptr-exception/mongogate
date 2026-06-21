@@ -44,16 +44,19 @@ type Config struct {
 	IncludeNS  []string `yaml:"include_ns"`  // format: "db.col" or "db.*"
 	ExcludeNS  []string `yaml:"exclude_ns"`
 
+	// Queryable Encryption has no toggle here on purpose: it's not a
+	// missing feature, it's a ceiling on what hash-based comparison can
+	// ever tell you about encrypted data (see docs/TESTING.md "Known
+	// limitations") - a flag that did nothing would just be misleading.
 	Verify struct {
-		Auth       bool `yaml:"auth"`
-		Cluster    bool `yaml:"cluster"`
-		Schema     bool `yaml:"schema"`
-		Index      bool `yaml:"index"`
-		Data       bool `yaml:"data"`
-		GridFS     bool `yaml:"gridfs"`
-		Sharding   bool `yaml:"sharding"`
-		Encryption bool `yaml:"encryption"`
-		Views      bool `yaml:"views"`
+		Auth     bool `yaml:"auth"`
+		Cluster  bool `yaml:"cluster"`
+		Schema   bool `yaml:"schema"`
+		Index    bool `yaml:"index"`
+		Data     bool `yaml:"data"`
+		GridFS   bool `yaml:"gridfs"`
+		Sharding bool `yaml:"sharding"`
+		Views    bool `yaml:"views"`
 		Bidirectional bool `yaml:"bidirectional"` // also scan target → source
 	} `yaml:"verify"`
 
