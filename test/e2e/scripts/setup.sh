@@ -95,18 +95,35 @@ setup_replica_set() {
     }
   "
 
+  # rs.status() can be read from any member regardless of who's primary, but
+  # createUser is a write - it must land on whichever pod actually holds the
+  # PRIMARY role. mongo-0 isn't guaranteed to be that pod (election doesn't
+  # always favor the initiator, especially under the CPU contention noted
+  # above). Hardcoding mongo-0 here caused a real failure: createUser threw
+  # "not primary", but the catch below swallowed it as "may already exist"
+  # and moved on, only to fail confusingly 120s later when no member could
+  # authenticate. Resolve the actual primary pod and target it directly.
   echo "==> [$ns] Waiting for PRIMARY election..."
+  PRIMARY_POD=""
   for i in $(seq 1 30); do
-    STATE=$(kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet --eval "rs.status().members.some(m => m.stateStr === 'PRIMARY')" 2>/dev/null | tail -1)
-    if [ "$STATE" = "true" ]; then
-      echo "    PRIMARY elected"
+    PRIMARY_HOST=$(kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet --eval "
+      var p = rs.status().members.find(m => m.stateStr === 'PRIMARY');
+      print(p ? p.name : '');
+    " 2>/dev/null | tail -1)
+    if [ -n "$PRIMARY_HOST" ]; then
+      PRIMARY_POD="${PRIMARY_HOST%%.*}"
+      echo "    PRIMARY elected: $PRIMARY_POD"
       break
     fi
     sleep 2
   done
+  if [ -z "$PRIMARY_POD" ]; then
+    echo "::error::[$ns] no PRIMARY elected after 60s"
+    exit 1
+  fi
 
-  echo "==> [$ns] Creating root user (via localhost exception)..."
-  kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet --eval "
+  echo "==> [$ns] Creating root user on $PRIMARY_POD (via localhost exception)..."
+  kubectl -n "$ns" exec "$PRIMARY_POD" -- "$shell" --quiet --eval "
     db.getSiblingDB('admin').runCommand({ping:1});
     try {
       db.getSiblingDB('admin').createUser({
@@ -115,9 +132,14 @@ setup_replica_set() {
       });
       print('root user created');
     } catch (e) {
-      print('root user may already exist: ' + e.message);
+      if (/already exists/i.test(e.message)) {
+        print('root user already exists');
+      } else {
+        print('ERROR creating root user: ' + e.message);
+        quit(1);
+      }
     }
-  " || true
+  "
 
   # createUser only waits for the configured write concern (majority on
   # 8.0's implicit default, but not necessarily all 3 members, and not
