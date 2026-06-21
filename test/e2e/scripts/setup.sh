@@ -16,6 +16,11 @@ KIND_DIR="kind"
 CLUSTER_NAME="mongogate-e2e"
 SOURCE_MONGO_VERSION="${SOURCE_MONGO_VERSION:-4.4}"
 TARGET_MONGO_VERSION="${TARGET_MONGO_VERSION:-8.0}"
+# Test-only credential for an ephemeral kind cluster, never a real secret -
+# still a single variable, not copy-pasted, so there's no way for a typo in
+# one of the many places that need it to silently diverge from the rest.
+MONGO_ROOT_USER="${MONGO_ROOT_USER:-root}"
+MONGO_ROOT_PASSWORD="${MONGO_ROOT_PASSWORD:-rootpass123}"
 
 echo "==> Creating kind cluster ($CLUSTER_NAME)..."
 if kind get clusters | grep -qx "$CLUSTER_NAME"; then
@@ -105,7 +110,7 @@ setup_replica_set() {
     db.getSiblingDB('admin').runCommand({ping:1});
     try {
       db.getSiblingDB('admin').createUser({
-        user: 'root', pwd: 'rootpass123',
+        user: '$MONGO_ROOT_USER', pwd: '$MONGO_ROOT_PASSWORD',
         roles: [{ role: 'root', db: 'admin' }]
       });
       print('root user created');
@@ -127,7 +132,7 @@ setup_replica_set() {
   for member in mongo-0 mongo-1 mongo-2; do
     for i in $(seq 1 30); do
       if kubectl -n "$ns" exec "$member" -- "$shell" --quiet \
-           -u root -p rootpass123 --authenticationDatabase admin \
+           -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin \
            --eval "1" >/dev/null 2>&1; then
         break
       fi
@@ -144,7 +149,7 @@ setup_replica_set() {
   SEEDLIST="mongo-0.mongo-headless.$ns.svc.cluster.local:27017,mongo-1.mongo-headless.$ns.svc.cluster.local:27017,mongo-2.mongo-headless.$ns.svc.cluster.local:27017"
   for i in $(seq 1 30); do
     if kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet \
-         "mongodb://root:rootpass123@${SEEDLIST}/admin?replicaSet=rs0" \
+         "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@${SEEDLIST}/admin?replicaSet=rs0" \
          --eval "1" >/dev/null 2>&1; then
       break
     fi

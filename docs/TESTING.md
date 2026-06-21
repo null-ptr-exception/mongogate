@@ -1013,20 +1013,60 @@ including all four matrix entries, alongside the pre-existing
 job, all five running in parallel.
 
 **A real flake found by watching repeated real runs, not assumed
-flaky-and-ignored**: a later push's `happy-path` job failed twice in a
-row with `loadgen` reporting `AuthenticationFailed` against the source
-replica set, while every `cross-version-matrix` job in the same runs
-passed. Root cause: `createUser` only waits for the configured write
-concern (majority on 8.0's implicit default - not necessarily *every*
-member, and not guaranteed at all on older defaults) before returning,
-but `loadgen`'s connection string lists all three `mongo-0,1,2` hosts and
-the driver authenticates against each one it discovers - including any
-secondary that hasn't replicated the new user yet. Fixed in `setup.sh`:
-after creating the root user, poll each of the three members directly
-with the new credentials until all three accept them, before declaring
-the replica set ready. This is exactly the kind of flake an
-infrastructure change can introduce invisibly - found because the new
-CI was actually watched run-over-run, not just confirmed green once.
+flaky-and-ignored** - and an honest account of how far that got, since
+it wasn't a clean one-fix story:
+
+1. First occurrence: `happy-path` failed with `loadgen` reporting
+   `AuthenticationFailed` against source. Theory: `createUser` only
+   waits for the configured write concern (majority on 8.0's implicit
+   default - not necessarily *every* member, and not guaranteed at all
+   on older defaults), but `loadgen`'s connection string lists all
+   three `mongo-0,1,2` hosts and authenticates against each one it
+   discovers, including any secondary that hasn't replicated the new
+   user yet. Fixed in `setup.sh`: poll each member directly with the
+   new credentials until all three accept them, before declaring ready.
+2. Recurred anyway, this time against target in a different job. Added
+   a second check matching `loadgen`'s actual multi-host connection
+   string pattern (not just per-member), since a direct per-pod check
+   doesn't exercise the same discovery/mechanism-negotiation path.
+3. Recurred a third time, with all retry attempts failing identically
+   for 50+ seconds straight - not a quick blip. Re-examined the timeline:
+   "Build and load tools image" (a CPU-heavy `go build`) ran
+   immediately after both replica sets were already live, 6 mongod
+   processes competing with a Go compile for CPU on a standard GHA
+   runner. Reordered both jobs to build the image *before* either
+   replica set starts.
+4. Recurred a fourth time regardless, against yet another matrix entry.
+   At this point, guessing at a fifth root-cause theory blind stopped
+   being productive. Added `dump_diag()` (queries `rs.status()` member
+   state/health on both sides on every failed retry) and widened the
+   retry budget from 5×10s to 10×15s, so a future occurrence leaves
+   real evidence in the CI log instead of just a stack trace, and has
+   more time to self-resolve in the meantime.
+5. Separately, audited every place the test credential
+   (`root`/`rootpass123`) was hardcoded - confirmed no typo/mismatch
+   existed (so this wasn't the cause), but it was repeated in 15+
+   places across two files with no single source of truth. Refactored
+   to one variable (`MONGO_ROOT_USER`/`MONGO_ROOT_PASSWORD`, workflow
+   `env:` in `e2e.yml`, env-var-with-default in `setup.sh`) - good
+   practice regardless, and removes any risk of this exact failure mode
+   from a future copy-paste divergence.
+6. Reproduced the underlying auth failure **locally** for the first
+   time during this investigation (previously only seen on GHA) -
+   immediately re-checked rs.status() and all 6 members' auth directly
+   afterward, found the cluster fully healthy and every member
+   authenticating correctly within seconds. This confirms the failure
+   window, whatever triggers it, is genuinely transient and self-heals
+   - consistent with the retry-based mitigation being the right kind of
+   fix, even without a single, clean root cause identified.
+
+**Where this actually stands**: this is a real, low-probability
+intermittent flake in the E2E test infrastructure (not in mongogate's
+product code, and not reproduced as a deterministic bug), substantially
+mitigated by four independent, real fixes (readiness checks, a second
+connection-pattern check, build/cluster ordering, a wider retry budget)
+but not proven eliminated. Diagnostics are in place so the next
+occurrence (if any) produces evidence instead of another guess.
 
 ---
 
