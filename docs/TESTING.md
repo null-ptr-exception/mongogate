@@ -70,6 +70,8 @@ mismatch injection per IssueType), `write` (continuous load), `mirror`
 | 19 | Deeper code review + first-ever real Phase 3 run | ⚠️ Found and fixed 4 more gaps (GridFS content check was dead code, checkpoint file was global not job-scoped, role inheritance never compared, replica topology never compared) plus a regression those fixes would have hit (admin/GridFS-internal collections guarantee false positives under generic comparison) and its proper replacement (dedicated FCV/version info, non-blocking) — see section 9 |
 | 20 | Full version matrix: 4.4/5.0/6.0/7.0 each vs 8.0 | ⚠️ Found a setup-script bug that would have broken on 6.0/7.0 (no legacy `mongo` shell at all), fixed and now auto-detects; found a third instance of the GridFS false-positive pattern in time series bucket internals (fixed); precisely bounded the `clustered_col` gap (4.4/5.0 only) and the time series bucket-format gap (5.0/6.0 only) — 7.0→8.0 is the only pair with zero structural findings — see section 10 |
 | 21 | Closing the 3 remaining blind spots from section 8.4 | ✅ Per-user auth mechanism and server-parameter coverage (2→5 params) fixed as blocking checks, confirmed live; default read/write concern fixed as informational (non-blocking by design, since it's version-driven) — see section 11 |
+| 22 | Cross-version testing in CI, not just by hand | ✅ Added `.github/workflows/e2e.yml`: same-version happy path + injected-drift detection, and the full 4.4/5.0/6.0/7.0 vs 8.0 matrix asserting the exact documented boundaries — confirmed passing on real GitHub Actions, not just locally — see section 12 |
+| 23 | Source/target version now a variable, not a hand-edited file | ✅ `setup.sh` takes `SOURCE_MONGO_VERSION`/`TARGET_MONGO_VERSION` env vars, substituted on the fly into `kubectl apply -f -` - confirmed `git diff` shows zero changes to the checked-in YAML after switching versions — see section 10 |
 
 ### Bugs found and fixed during this pass
 
@@ -810,6 +812,18 @@ baseline, same kind cluster (source namespace torn down and redeployed
 with a different image tag between runs; target/monitor/tools left
 running throughout).
 
+At the time, each version switch meant hand-editing the image tag in
+`test/e2e/kind/source/statefulset.yaml` and reverting it afterward - easy
+to get wrong and it leaves a dirty diff. Fixed afterward (not before this
+matrix was run, but before anyone else has to repeat it by hand):
+`setup.sh` now takes `SOURCE_MONGO_VERSION`/`TARGET_MONGO_VERSION` as env
+vars, substituted on the fly and piped straight into `kubectl apply -f -`
+- the checked-in YAML is never written to. Reproduce any single pair from
+this matrix with, e.g., `SOURCE_MONGO_VERSION=6.0 bash setup.sh`. The
+`.github/workflows/e2e.yml` cross-version matrix job (section 12) uses
+this same mechanism via its `matrix.source_version`, confirmed live with
+`git diff` showing zero changes to the YAML after each run.
+
 **A real setup bug found and fixed before any of this could run**:
 `setup.sh`'s shell selection from section 8 (`mongo` for source, `mongosh`
 for target) only happened to work for the one pair already tested -
@@ -962,6 +976,40 @@ unchecked.
 
 All three re-verified together against the same 4.4/8.0 pair after
 `go build && go vet && go test ./... && golangci-lint run` clean.
+
+---
+
+## 12. Automating what sections 1-11 only ever ran by hand
+
+`.github/workflows/ci.yml` only ever ran `go build`/`go vet`/`go test`/
+`golangci-lint` - none of which touches a real MongoDB cluster, so every
+finding in sections 1-11 above was confirmed by hand and could regress
+silently. Added `.github/workflows/e2e.yml`, a kind-based workflow with
+two jobs:
+
+- **`happy-path`** - forces both sides to `mongo:8.0`, runs the seeded
+  baseline, asserts Phase 1 and Phase 3 both pass cleanly, then drops a
+  real index on target and asserts Phase 1 now fails. This is a
+  regression test for detection itself, not just "does it build" - a
+  future change that silently breaks index comparison would fail this
+  job even though `go test` stays green.
+- **`cross-version-matrix`** - a 4-way matrix (`mongo:4.4`/`5.0`/`6.0`/
+  `7.0` as source, `8.0` as target) that asserts the *exact* findings
+  documented in section 10: `clusteredIndex` diff present for 4.4/5.0,
+  absent for 6.0/7.0; `meta_1_ts_1` diff present for 4.4/5.0/6.0, absent
+  for 7.0; and zero false positives in Phase 3 data verification across
+  all four. A failure here means either a real regression, or a fix that
+  legitimately moved one of these documented boundaries and this section
+  needs updating to match - not something to wave through.
+
+Both jobs use `setup.sh`'s `SOURCE_MONGO_VERSION` env var (see section 10)
+to select the version, never editing the checked-in YAML.
+
+**Confirmed live, not just written and hoped**: pushed and watched via
+`gh run watch` - both jobs passed on real GitHub Actions infrastructure,
+including all four matrix entries, alongside the pre-existing
+`go build`/`vet`/`test`/`golangci-lint` job. Runtime: ~3-4 minutes per
+job, all five running in parallel.
 
 ---
 

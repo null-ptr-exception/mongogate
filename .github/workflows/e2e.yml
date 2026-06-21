@@ -39,12 +39,10 @@ jobs:
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
-      - name: Force both sides to the same mongo version (true same-version baseline, independent of whatever cross-version tag is checked in)
-        run: |
-          sed -i "s|image: mongo:.*|image: mongo:8.0|" test/e2e/kind/source/statefulset.yaml
-
-      - name: Bring up E2E environment
+      - name: Bring up E2E environment (source forced to match target - true same-version baseline)
         working-directory: test/e2e/scripts
+        env:
+          SOURCE_MONGO_VERSION: "8.0"
         run: bash setup.sh
 
       - name: Build and load tools image
@@ -136,12 +134,10 @@ jobs:
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
-      - name: Set source image to the matrix version
-        run: |
-          sed -i "s|image: mongo:.*|image: mongo:${{ matrix.source_version }}|" test/e2e/kind/source/statefulset.yaml
-
-      - name: Bring up E2E environment
+      - name: Bring up E2E environment (source = this matrix entry's version)
         working-directory: test/e2e/scripts
+        env:
+          SOURCE_MONGO_VERSION: ${{ matrix.source_version }}
         run: bash setup.sh
 
       - name: Build and load tools image

@@ -2,10 +2,20 @@
 # Brings up the mongogate E2E test environment: a kind cluster with two
 # namespaces (mongo-source, mongo-target), each a 3-node MongoDB replica
 # set with auth enabled, plus a monitor Mongo instance.
+#
+# Mongo version per side is a variable, not something to hand-edit in the
+# checked-in YAML: override via env var, e.g.
+#   SOURCE_MONGO_VERSION=7.0 bash setup.sh
+# Defaults match what's checked in (source 4.4, target 8.0) so plain
+# `bash setup.sh` reproduces docs/TESTING.md section 8 unchanged. Neither
+# variable ever touches the YAML on disk - substituted on the fly and piped
+# straight into `kubectl apply -f -`.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 KIND_DIR="kind"
 CLUSTER_NAME="mongogate-e2e"
+SOURCE_MONGO_VERSION="${SOURCE_MONGO_VERSION:-4.4}"
+TARGET_MONGO_VERSION="${TARGET_MONGO_VERSION:-8.0}"
 
 echo "==> Creating kind cluster ($CLUSTER_NAME)..."
 if kind get clusters | grep -qx "$CLUSTER_NAME"; then
@@ -31,7 +41,12 @@ setup_replica_set() {
   fi
 
   echo "==> [$ns] Applying StatefulSet..."
-  kubectl apply -f "$KIND_DIR/$([ "$ns" = mongo-source ] && echo source || echo target)/statefulset.yaml"
+  local side version
+  if [ "$ns" = mongo-source ]; then side="source"; version="$SOURCE_MONGO_VERSION"
+  else side="target"; version="$TARGET_MONGO_VERSION"
+  fi
+  sed "s|image: mongo:[^[:space:]]*|image: mongo:${version}|g" "$KIND_DIR/$side/statefulset.yaml" \
+    | kubectl apply -f -
 
   echo "==> [$ns] Waiting for all 3 replicas to be ready..."
   kubectl -n "$ns" wait --for=jsonpath='{.status.readyReplicas}'=3 statefulset/mongo --timeout=240s
