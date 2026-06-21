@@ -128,16 +128,44 @@ setup_replica_set() {
   # "AuthenticationFailed" from loadgen hitting exactly that race. Close
   # the window by confirming the user is independently authenticatable on
   # every member before declaring the replica set ready.
+  # Both checks below previously just retried-then-fell-through: if every
+  # attempt failed, the for loop simply ended and the function returned
+  # "success" anyway, since reaching the end of a bash for loop isn't a
+  # failure. Confirmed live with a diagnostic dump (real rs.status() output
+  # in a failing CI run): mongo-target stayed perfectly healthy
+  # (PRIMARY+2 SECONDARY, health:1) for the entire 2+ minute window while
+  # mongo-source's root user never became authenticatable at all - even a
+  # fresh, direct mongosh session couldn't, not just loadgen. That's a real
+  # stuck-replica-set case the old check silently waited out and then lied
+  # about. Now both checks actually fail the script (set -e) if the budget
+  # is exhausted, with the same rs.status() dump used in e2e.yml so a stuck
+  # cluster is diagnosable instead of surfacing as a confusing downstream
+  # AuthenticationFailed three steps later.
+  dump_rs_status() {
+    echo "    [$ns] rs.status() member states:"
+    kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" \
+      --authenticationDatabase admin --eval \
+      "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" \
+      2>&1 || echo "    [$ns] (couldn't even query rs.status() - root user itself isn't authenticating)"
+  }
+
   echo "==> [$ns] Waiting for root user to replicate to every member..."
   for member in mongo-0 mongo-1 mongo-2; do
-    for i in $(seq 1 30); do
+    ok=false
+    for i in $(seq 1 60); do
       if kubectl -n "$ns" exec "$member" -- "$shell" --quiet \
            -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin \
            --eval "1" >/dev/null 2>&1; then
+        ok=true
         break
       fi
-      sleep 1
+      sleep 2
     done
+    if [ "$ok" != true ]; then
+      echo "::error::[$ns] $member never became authenticatable after 120s"
+      dump_rs_status
+      exit 1
+    fi
   done
 
   # The per-member check above wasn't sufficient on its own - confirmed
@@ -147,14 +175,21 @@ setup_replica_set() {
   # negotiation loadgen's driver does when given all three hosts in one
   # connection string. Check that too, since that's what actually failed.
   SEEDLIST="mongo-0.mongo-headless.$ns.svc.cluster.local:27017,mongo-1.mongo-headless.$ns.svc.cluster.local:27017,mongo-2.mongo-headless.$ns.svc.cluster.local:27017"
-  for i in $(seq 1 30); do
+  ok=false
+  for i in $(seq 1 60); do
     if kubectl -n "$ns" exec mongo-0 -- "$shell" --quiet \
          "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@${SEEDLIST}/admin?replicaSet=rs0" \
          --eval "1" >/dev/null 2>&1; then
+      ok=true
       break
     fi
-    sleep 1
+    sleep 2
   done
+  if [ "$ok" != true ]; then
+    echo "::error::[$ns] multi-host connection string never became authenticatable after 120s"
+    dump_rs_status
+    exit 1
+  fi
 
   echo "==> [$ns] Replica set ready."
 }
