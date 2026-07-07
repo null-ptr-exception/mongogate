@@ -2,6 +2,7 @@ package verifier
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -128,10 +129,14 @@ func verifyOneCollection(
 	}
 
 	bar.Done()
+	// len(Errors) == 0 is part of Passed: a collection whose scan errored out
+	// (e.g. "find failed") was never actually verified, and previously could
+	// slip through as passing when counts happened to match.
 	result.Passed = result.CountMatch &&
 		result.MissingCount == 0 &&
 		result.DifferentCount == 0 &&
-		result.ExtraInTarget == 0
+		result.ExtraInTarget == 0 &&
+		len(result.Errors) == 0
 
 	return result
 }
@@ -157,9 +162,16 @@ func processSrcToTgt(
 		}
 	}
 
+	// allowDiskUse everywhere a server-side sort can happen: without it any
+	// sort that exceeds MongoDB's 100MB in-memory limit fails with
+	// QueryExceededMemoryLimitNoDiskUseAllowed. The $sample below is the
+	// usual trigger - a sample size above 5% of the collection falls back to
+	// a full scan + random blocking sort. (allowDiskUse on find requires
+	// server >= 4.4; the supported matrix starts there.)
 	findOpts := options.Find().
 		SetSort(bson.D{{Key: "_id", Value: 1}}).
-		SetBatchSize(int32(opts.BatchSize))
+		SetBatchSize(int32(opts.BatchSize)).
+		SetAllowDiskUse(true)
 
 	var cur *mongo.Cursor
 	var err error
@@ -171,7 +183,7 @@ func processSrcToTgt(
 		}
 		cur, err = srcCol.Aggregate(ctx, mongo.Pipeline{
 			{{Key: "$sample", Value: bson.M{"size": sampleSize}}},
-		})
+		}, options.Aggregate().SetAllowDiskUse(true))
 	} else {
 		cur, err = srcCol.Find(ctx, filter, findOpts)
 	}
@@ -192,10 +204,18 @@ func processSrcToTgt(
 		var tgtDoc bson.M
 		findErr := findWithRetry(ctx, tgtCol, docID, &tgtDoc, opts)
 
-		if findErr != nil {
+		if errors.Is(findErr, mongo.ErrNoDocuments) {
 			result.MissingCount++
 			if len(result.MissingSample) < 50 {
 				result.MissingSample = append(result.MissingSample, fmt.Sprintf("%v", docID))
+			}
+		} else if findErr != nil {
+			// Transient failure (timeout, network): presence in target is
+			// unknown - counting it as missing would fabricate diffs whenever
+			// the server is merely slow.
+			if len(result.Errors) < 20 {
+				result.Errors = append(result.Errors,
+					fmt.Sprintf("lookup failed for _id=%v: %v", docID, findErr))
 			}
 		} else {
 			passed, diffs := utils.DeepCompare(srcDoc, tgtDoc, opts.HashOpts)
@@ -267,8 +287,10 @@ func processTgtToSrc(
 		options.Find().
 			SetSort(bson.D{{Key: "_id", Value: 1}}).
 			SetBatchSize(int32(opts.BatchSize)).
+			SetAllowDiskUse(true).
 			SetProjection(bson.M{"_id": 1})) // only pull _id to save bandwidth
 	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("reverse find failed: %v", err))
 		return
 	}
 	defer cur.Close(ctx)
@@ -281,12 +303,18 @@ func processTgtToSrc(
 		docID := doc["_id"]
 
 		var srcDoc bson.M
-		if err := srcCol.FindOne(ctx, bson.M{"_id": docID}).Decode(&srcDoc); err != nil {
+		findErr := findWithRetry(ctx, srcCol, docID, &srcDoc, opts)
+		if errors.Is(findErr, mongo.ErrNoDocuments) {
 			// exists in target but not in source
 			result.ExtraInTarget++
 			if len(result.ExtraInTargetSample) < 20 {
 				result.ExtraInTargetSample = append(result.ExtraInTargetSample,
 					fmt.Sprintf("%v", docID))
+			}
+		} else if findErr != nil {
+			if len(result.Errors) < 20 {
+				result.Errors = append(result.Errors,
+					fmt.Sprintf("reverse lookup failed for _id=%v: %v", docID, findErr))
 			}
 		}
 	}
@@ -307,9 +335,15 @@ func countWithRetry(ctx context.Context, col *mongo.Collection, opts DataVerifyO
 	return 0
 }
 
+// findWithRetry looks the document up with a per-attempt timeout. The
+// returned error keeps its identity so callers can tell "genuinely absent"
+// (mongo.ErrNoDocuments, retried anyway because replication lag can make a
+// doc appear late) apart from transient failures like context deadlines -
+// the two must be reported differently.
 func findWithRetry(ctx context.Context, col *mongo.Collection,
 	docID interface{}, result *bson.M, opts DataVerifyOptions) error {
 
+	var lastErr error
 	for i := 0; i <= opts.RetryCount; i++ {
 		tCtx, cancel := context.WithTimeout(ctx,
 			time.Duration(opts.TimeoutSecs)*time.Second)
@@ -318,12 +352,12 @@ func findWithRetry(ctx context.Context, col *mongo.Collection,
 		if err == nil {
 			return nil
 		}
+		lastErr = err
 		if i < opts.RetryCount {
 			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
 		}
-		_ = err
 	}
-	return fmt.Errorf("not found after %d retries", opts.RetryCount)
+	return lastErr
 }
 
 func formatDiffSample(docID interface{}, diffs []utils.DiffDetail) string {
