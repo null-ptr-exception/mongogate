@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.mongodb.org/mongo-driver/mongo"
@@ -36,6 +38,7 @@ func main() {
 	excludeNS := flag.String("exclude-ns", "", "single namespace to exclude")
 	autoRepair := flag.Bool("auto-repair", false, "after Phase 3, write its diffs (missing/different docs) from source to target - mutates the target cluster")
 	exportCSV := flag.String("export-csv", "", "path to export diff CSV (or 'auto')")
+	loopInterval := flag.Duration("loop-interval", 0, "if > 0, keep repeating Phase 2 on this interval instead of exiting after one pass - keeps /metrics and the HTTP API alive for a live dashboard. Requires --phase 2; auto-repair and CSV export are skipped in this mode since a sampled pass is not a final answer.")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -74,6 +77,10 @@ func main() {
 	runPhase3 := *phase == "3" || *phase == "all"
 	if !runPhase1 && !runPhase2 && !runPhase3 {
 		fmt.Fprintf(os.Stderr, "unknown --phase %q (want 1, 2, 3, or all)\n", *phase)
+		os.Exit(1)
+	}
+	if *loopInterval > 0 && *phase != "2" {
+		fmt.Fprintf(os.Stderr, "--loop-interval requires --phase 2 (Phase 1's structural checks and Phase 3's full/exact scan aren't meant to repeat on a short interval)\n")
 		os.Exit(1)
 	}
 
@@ -183,6 +190,17 @@ func main() {
 			Bidirectional: cfg.Verify.Bidirectional, DryRun: cfg.DryRun,
 			HashOpts: toHashOptions(cfg.HashOptions),
 		}
+
+		if *loopInterval > 0 {
+			// Long-lived dashboard mode: the normal run-once-and-exit tail
+			// below (CSV export, auto-repair, os.Exit) never runs here - a
+			// sampled pass is a live snapshot, not a final answer, and
+			// exiting would tear down the very /metrics and HTTP API
+			// listeners this mode exists to keep serving.
+			runLoop(ctx, src, tgt, collections, opts, mw, am, pm, rpt, httpSrv, *loopInterval, *phase)
+			return
+		}
+
 		verifier.VerifyAllData(ctx, src, tgt, collections, opts, mw, am, pm, rpt)
 	}
 
@@ -231,6 +249,53 @@ func main() {
 		os.Exit(0)
 	}
 	os.Exit(1)
+}
+
+// runLoop repeats a Phase 2 pass on the given interval until the process
+// receives SIGINT/SIGTERM (e.g. `docker stop`), printing and alerting after
+// each pass but never calling os.Exit - that would kill the Prometheus and
+// HTTP API listeners this mode exists to keep alive for a live dashboard.
+func runLoop(
+	ctx context.Context,
+	src, tgt *mongo.Client,
+	collections []verifier.CollectionTask,
+	opts verifier.DataVerifyOptions,
+	mw *monitor.MetricsWriter,
+	am *alert.AlertManager,
+	pm *promMetrics.MetricsServer,
+	rpt *report.Report,
+	httpSrv *httpapi.Server,
+	interval time.Duration,
+	phase string,
+) {
+	fmt.Printf("\n🔁 Loop mode: repeating Phase 2 every %s - Ctrl+C or SIGTERM to stop\n", interval)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		verifier.VerifyAllData(ctx, src, tgt, collections, opts, mw, am, pm, rpt)
+		rpt.Print()
+		if err := rpt.Save(); err != nil {
+			fmt.Printf("failed to save JSON report: %v\n", err)
+		}
+
+		level, title := "INFO", "✅ Verification passed"
+		if !rpt.AllPassed() {
+			level, title = "CRITICAL", "🚨 Verification failed"
+		}
+		am.Fire(alert.AlertEvent{Level: level, Title: title, Message: fmt.Sprintf("phase=%s (loop)", phase)})
+
+		select {
+		case <-stop:
+			httpSrv.Stop()
+			am.Wait()
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func mustConnect(ctx context.Context, label, uri string) *mongo.Client {

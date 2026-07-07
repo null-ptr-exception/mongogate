@@ -1,0 +1,37 @@
+source_uri: "mongodb://source:27017/?replicaSet=rs0"
+target_uri: "mongodb://target:27017"
+monitor_uri: "mongodb://monitor:27017/"
+
+batch_size: 500
+max_workers: 4
+rate_limit_ms: 0
+timeout_secs: 30
+retry_count: 3
+retry_wait_ms: 500
+
+skip_dbs:
+  - local
+  - config
+  - admin
+
+# Standalone containers with no users/replset config on the target and no
+# auth enabled anywhere - auth/cluster checks would either no-op or false
+# positive here, and neither is what this stack is for.
+verify:
+  auth: false
+  cluster: false
+  schema: false
+  index: false
+  data: true
+  gridfs: false
+  views: false
+  bidirectional: true
+
+sample_rate: 0.1
+
+dry_run: false
+auto_repair: false
+export_csv: ""
+
+http_port: 8080
+prometheus_port: 9090
