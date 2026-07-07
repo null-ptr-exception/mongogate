@@ -2,7 +2,6 @@ package verifier
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -233,31 +232,52 @@ func processSrcToTgt(
 			return
 		}
 
+		// Re-check ids absent from the first read with the same retry budget
+		// and waits the per-document path used to spend - replication lag can
+		// make documents show up late - but as whole-batch $in queries. A
+		// target that has fallen far behind costs RetryCount extra queries
+		// per batch instead of ~1.5s per missing document; the per-document
+		// version was a retry storm that made a badly lagging target look
+		// like a hung verifier, slowest exactly when you most need the answer.
+		missingIDs := make([]interface{}, 0)
+		for _, d := range batch {
+			if _, ok := tgtDocs[idKey(d["_id"])]; !ok {
+				missingIDs = append(missingIDs, d["_id"])
+			}
+		}
+		presenceUnknown := false
+		for attempt := 0; attempt < opts.RetryCount && len(missingIDs) > 0; attempt++ {
+			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
+			late, err := lookupBatch(ctx, tgtCol, missingIDs, false, opts)
+			if err != nil {
+				// Transient failure (timeout, network): presence of the
+				// still-missing ids is unknown - counting them as missing
+				// would fabricate diffs whenever the server is merely slow.
+				presenceUnknown = true
+				if len(result.Errors) < 20 {
+					result.Errors = append(result.Errors,
+						fmt.Sprintf("recheck lookup failed (%d docs): %v", len(missingIDs), err))
+				}
+				break
+			}
+			still := missingIDs[:0]
+			for _, id := range missingIDs {
+				if doc, ok := late[idKey(id)]; ok {
+					tgtDocs[idKey(id)] = doc
+				} else {
+					still = append(still, id)
+				}
+			}
+			missingIDs = still
+		}
+
 		for _, srcDoc := range batch {
 			docID := srcDoc["_id"]
 			tgtDoc, found := tgtDocs[idKey(docID)]
-			if !found {
-				// Absent from the batched read: re-check individually with
-				// the retry budget before declaring it missing - replication
-				// lag can make a document show up late.
-				var late bson.M
-				findErr := findWithRetry(ctx, tgtCol, docID, &late, opts)
-				switch {
-				case findErr == nil:
-					tgtDoc, found = late, true
-				case errors.Is(findErr, mongo.ErrNoDocuments):
-					result.MissingCount++
-					if len(result.MissingSample) < 50 {
-						result.MissingSample = append(result.MissingSample, fmt.Sprintf("%v", docID))
-					}
-				default:
-					// Transient failure (timeout, network): presence in
-					// target is unknown - counting it as missing would
-					// fabricate diffs whenever the server is merely slow.
-					if len(result.Errors) < 20 {
-						result.Errors = append(result.Errors,
-							fmt.Sprintf("lookup failed for _id=%v: %v", docID, findErr))
-					}
+			if !found && !presenceUnknown {
+				result.MissingCount++
+				if len(result.MissingSample) < 50 {
+					result.MissingSample = append(result.MissingSample, fmt.Sprintf("%v", docID))
 				}
 			}
 
@@ -375,26 +395,39 @@ func processTgtToSrc(
 			ids = ids[:0]
 			return
 		}
+		// Same batched re-check as the forward path: absent ids get the full
+		// retry budget as whole-batch $in queries before being declared extra.
+		missingIDs := make([]interface{}, 0)
 		for _, docID := range ids {
-			if _, ok := srcDocs[idKey(docID)]; ok {
-				continue
+			if _, ok := srcDocs[idKey(docID)]; !ok {
+				missingIDs = append(missingIDs, docID)
 			}
-			var srcDoc bson.M
-			findErr := findWithRetry(ctx, srcCol, docID, &srcDoc, opts)
-			switch {
-			case findErr == nil:
-			case errors.Is(findErr, mongo.ErrNoDocuments):
-				// exists in target but not in source
-				result.ExtraInTarget++
-				if len(result.ExtraInTargetSample) < 20 {
-					result.ExtraInTargetSample = append(result.ExtraInTargetSample,
-						fmt.Sprintf("%v", docID))
-				}
-			default:
+		}
+		for attempt := 0; attempt < opts.RetryCount && len(missingIDs) > 0; attempt++ {
+			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
+			late, err := lookupBatch(ctx, srcCol, missingIDs, true, opts)
+			if err != nil {
 				if len(result.Errors) < 20 {
 					result.Errors = append(result.Errors,
-						fmt.Sprintf("reverse lookup failed for _id=%v: %v", docID, findErr))
+						fmt.Sprintf("reverse recheck lookup failed (%d docs): %v", len(missingIDs), err))
 				}
+				missingIDs = nil // presence unknown - don't count as extra
+				break
+			}
+			still := missingIDs[:0]
+			for _, id := range missingIDs {
+				if _, ok := late[idKey(id)]; !ok {
+					still = append(still, id)
+				}
+			}
+			missingIDs = still
+		}
+		for _, docID := range missingIDs {
+			// exists in target but not in source
+			result.ExtraInTarget++
+			if len(result.ExtraInTargetSample) < 20 {
+				result.ExtraInTargetSample = append(result.ExtraInTargetSample,
+					fmt.Sprintf("%v", docID))
 			}
 		}
 		ids = ids[:0]
@@ -498,31 +531,6 @@ func idKey(id interface{}) string {
 		return fmt.Sprintf("%v", id)
 	}
 	return string(b)
-}
-
-// findWithRetry looks the document up with a per-attempt timeout. The
-// returned error keeps its identity so callers can tell "genuinely absent"
-// (mongo.ErrNoDocuments, retried anyway because replication lag can make a
-// doc appear late) apart from transient failures like context deadlines -
-// the two must be reported differently.
-func findWithRetry(ctx context.Context, col *mongo.Collection,
-	docID interface{}, result *bson.M, opts DataVerifyOptions) error {
-
-	var lastErr error
-	for i := 0; i <= opts.RetryCount; i++ {
-		tCtx, cancel := context.WithTimeout(ctx,
-			time.Duration(opts.TimeoutSecs)*time.Second)
-		err := col.FindOne(tCtx, bson.M{"_id": docID}).Decode(result)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if i < opts.RetryCount {
-			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
-		}
-	}
-	return lastErr
 }
 
 func formatDiffSample(docID interface{}, diffs []utils.DiffDetail) string {
