@@ -218,19 +218,23 @@ func processSrcToTgt(
 		for i, d := range batch {
 			ids[i] = d["_id"]
 		}
-		tgtDocs, lookupErr := lookupBatch(ctx, tgtCol, ids, false, opts)
-		if lookupErr != nil {
-			// The whole batch is unknowable - record the failure instead of
-			// fabricating len(batch) missing docs.
-			if len(result.Errors) < 20 {
-				result.Errors = append(result.Errors,
-					fmt.Sprintf("batch lookup failed (%d docs): %v", len(batch), lookupErr))
+		// unverified tracks ids whose presence in target lookupBatchResilient
+		// could not determine even after bisecting - those are skipped below
+		// (not counted missing or different) instead of the old behavior of
+		// abandoning the entire batch on one failed $in query.
+		unverified := make(map[string]bool)
+		recordLookupErr := func(prefix string) func([]interface{}, error) {
+			return func(failedIDs []interface{}, err error) {
+				for _, id := range failedIDs {
+					unverified[idKey(id)] = true
+				}
+				if len(result.Errors) < 20 {
+					result.Errors = append(result.Errors,
+						fmt.Sprintf("%s (%d docs): %v", prefix, len(failedIDs), err))
+				}
 			}
-			processed += int64(len(batch))
-			bar.Update(processed)
-			batch = batch[:0]
-			return
 		}
+		tgtDocs := lookupBatchResilient(ctx, tgtCol, ids, false, opts, recordLookupErr("batch lookup failed"))
 
 		// Re-check ids absent from the first read with the same retry budget
 		// and waits the per-document path used to spend - replication lag can
@@ -241,29 +245,25 @@ func processSrcToTgt(
 		// like a hung verifier, slowest exactly when you most need the answer.
 		missingIDs := make([]interface{}, 0)
 		for _, d := range batch {
-			if _, ok := tgtDocs[idKey(d["_id"])]; !ok {
+			key := idKey(d["_id"])
+			if unverified[key] {
+				continue
+			}
+			if _, ok := tgtDocs[key]; !ok {
 				missingIDs = append(missingIDs, d["_id"])
 			}
 		}
-		presenceUnknown := false
 		for attempt := 0; attempt < opts.RetryCount && len(missingIDs) > 0; attempt++ {
 			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
-			late, err := lookupBatch(ctx, tgtCol, missingIDs, false, opts)
-			if err != nil {
-				// Transient failure (timeout, network): presence of the
-				// still-missing ids is unknown - counting them as missing
-				// would fabricate diffs whenever the server is merely slow.
-				presenceUnknown = true
-				if len(result.Errors) < 20 {
-					result.Errors = append(result.Errors,
-						fmt.Sprintf("recheck lookup failed (%d docs): %v", len(missingIDs), err))
-				}
-				break
-			}
+			late := lookupBatchResilient(ctx, tgtCol, missingIDs, false, opts, recordLookupErr("recheck lookup failed"))
 			still := missingIDs[:0]
 			for _, id := range missingIDs {
-				if doc, ok := late[idKey(id)]; ok {
-					tgtDocs[idKey(id)] = doc
+				key := idKey(id)
+				if unverified[key] {
+					continue
+				}
+				if doc, ok := late[key]; ok {
+					tgtDocs[key] = doc
 				} else {
 					still = append(still, id)
 				}
@@ -273,8 +273,16 @@ func processSrcToTgt(
 
 		for _, srcDoc := range batch {
 			docID := srcDoc["_id"]
-			tgtDoc, found := tgtDocs[idKey(docID)]
-			if !found && !presenceUnknown {
+			key := idKey(docID)
+			if unverified[key] {
+				// Presence/content unknown even after bisected retries -
+				// counting it either way would fabricate a result.
+				processed++
+				bar.Update(processed)
+				continue
+			}
+			tgtDoc, found := tgtDocs[key]
+			if !found {
 				result.MissingCount++
 				if len(result.MissingSample) < 50 {
 					result.MissingSample = append(result.MissingSample, fmt.Sprintf("%v", docID))
@@ -386,37 +394,44 @@ func processTgtToSrc(
 		if len(ids) == 0 {
 			return
 		}
-		srcDocs, lookupErr := lookupBatch(ctx, srcCol, ids, true, opts)
-		if lookupErr != nil {
-			if len(result.Errors) < 20 {
-				result.Errors = append(result.Errors,
-					fmt.Sprintf("reverse batch lookup failed (%d docs): %v", len(ids), lookupErr))
+		// unverified tracks ids bisection still couldn't resolve - excluded
+		// below rather than either declared extra or dropping the whole
+		// batch's worth of ids on one failed $in query.
+		unverified := make(map[string]bool)
+		recordLookupErr := func(prefix string) func([]interface{}, error) {
+			return func(failedIDs []interface{}, err error) {
+				for _, id := range failedIDs {
+					unverified[idKey(id)] = true
+				}
+				if len(result.Errors) < 20 {
+					result.Errors = append(result.Errors,
+						fmt.Sprintf("%s (%d docs): %v", prefix, len(failedIDs), err))
+				}
 			}
-			ids = ids[:0]
-			return
 		}
+		srcDocs := lookupBatchResilient(ctx, srcCol, ids, true, opts, recordLookupErr("reverse batch lookup failed"))
 		// Same batched re-check as the forward path: absent ids get the full
 		// retry budget as whole-batch $in queries before being declared extra.
 		missingIDs := make([]interface{}, 0)
 		for _, docID := range ids {
-			if _, ok := srcDocs[idKey(docID)]; !ok {
+			key := idKey(docID)
+			if unverified[key] {
+				continue
+			}
+			if _, ok := srcDocs[key]; !ok {
 				missingIDs = append(missingIDs, docID)
 			}
 		}
 		for attempt := 0; attempt < opts.RetryCount && len(missingIDs) > 0; attempt++ {
 			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
-			late, err := lookupBatch(ctx, srcCol, missingIDs, true, opts)
-			if err != nil {
-				if len(result.Errors) < 20 {
-					result.Errors = append(result.Errors,
-						fmt.Sprintf("reverse recheck lookup failed (%d docs): %v", len(missingIDs), err))
-				}
-				missingIDs = nil // presence unknown - don't count as extra
-				break
-			}
+			late := lookupBatchResilient(ctx, srcCol, missingIDs, true, opts, recordLookupErr("reverse recheck lookup failed"))
 			still := missingIDs[:0]
 			for _, id := range missingIDs {
-				if _, ok := late[idKey(id)]; !ok {
+				key := idKey(id)
+				if unverified[key] {
+					continue
+				}
+				if _, ok := late[key]; !ok {
 					still = append(still, id)
 				}
 			}
@@ -520,6 +535,43 @@ func lookupBatch(ctx context.Context, col *mongo.Collection,
 		}
 	}
 	return nil, lastErr
+}
+
+// minLookupSubBatch bounds how far lookupBatchResilient bisects a failing
+// batch: below this many ids, a sub-batch that still fails is reported to
+// onError as unverifiable rather than split further. Unbounded bisection
+// would turn one failing query into batch_size individually-retried
+// queries under a total outage - the same retry storm the batched design
+// replaced; capping the floor keeps worst-case amplification to
+// O(log(batch_size/minLookupSubBatch)) instead of O(batch_size).
+const minLookupSubBatch = 20
+
+// lookupBatchResilient looks up ids in one $in query and, if that query
+// still fails after lookupBatch's own retry budget, bisects into two
+// sub-batches and retries those independently instead of abandoning the
+// whole batch. A batch that times out under load often succeeds at half the
+// size (response time scales with result size) or isolates the handful of
+// ids actually causing trouble; onError is called only with the ids that
+// remain unverifiable once bisection bottoms out, so a systemic hiccup
+// costs at most a small sub-batch of comparisons instead of the whole batch.
+func lookupBatchResilient(ctx context.Context, col *mongo.Collection,
+	ids []interface{}, idOnly bool, opts DataVerifyOptions,
+	onError func(failedIDs []interface{}, err error)) map[string]bson.M {
+
+	docs, err := lookupBatch(ctx, col, ids, idOnly, opts)
+	if err == nil {
+		return docs
+	}
+	if len(ids) <= minLookupSubBatch {
+		onError(ids, err)
+		return map[string]bson.M{}
+	}
+	mid := len(ids) / 2
+	out := lookupBatchResilient(ctx, col, ids[:mid], idOnly, opts, onError)
+	for k, v := range lookupBatchResilient(ctx, col, ids[mid:], idOnly, opts, onError) {
+		out[k] = v
+	}
+	return out
 }
 
 // idKey builds a map key for an _id that is faithful to BSON typing: the
