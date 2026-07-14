@@ -6,6 +6,15 @@
 **Lines of code:** ~3,000
 **File count:** 21 (+ test/e2e tooling)
 
+This is the design specification - what the system is intended to do. For
+what has actually been confirmed against a real MongoDB cluster (including
+several places this document used to be wrong until this pass corrected
+them), see [`docs/TESTING.md`](TESTING.md). Notably: `cmd/mongogate` - the
+binary this whole document describes - did not exist as buildable code in
+any branch of this repository until `docs/TESTING.md` section 8 wrote it;
+no verification scenario described here had ever been run for real before
+that.
+
 ---
 
 ## Table of Contents
@@ -110,7 +119,10 @@ Hash carries hash_is_exact: true/false.
 ### Principle 4: Interruptible, resumable
 
 ```
-A checkpoint (checkpoints.json) is saved every 1,000 documents.
+A checkpoint is saved every 1,000 documents, to a filename derived from a
+hash of source_uri+target_uri (e.g. checkpoints_a1b2c3d4e5f6.json) rather
+than a fixed checkpoints.json - so two different migration jobs run from
+the same working directory don't clobber each other's resume state.
 If the process crashes mid-run, --resume picks up from the last checkpoint.
 No need to start over from scratch.
 ```
@@ -143,7 +155,7 @@ mongogate/
 │   │   ├── schema_verifier.go     # DB, collection, options, validator
 │   │   ├── index_verifier.go      # Every index type
 │   │   ├── view_verifier.go       # View definitions
-│   │   ├── gridfs_verifier.go     # GridFS metadata + MD5
+│   │   ├── gridfs_verifier.go     # GridFS metadata + content hash (SHA256)
 │   │   └── data_verifier.go       # Document count + hash, multi-threaded
 │   ├── utils/
 │   │   ├── hasher.go              # SHA256 hash + normalization + DeepCompare
@@ -259,7 +271,7 @@ starts      sync done       < 10s           write-stop
 - Collection list, options, validator, collation, time series, TTL, capped
 - Every index type
 - View definitions
-- GridFS metadata (excluding MD5)
+- GridFS metadata (excluding content hash)
 
 **Typical duration:** 1–5 minutes
 
@@ -279,7 +291,8 @@ confirming the migration is broadly on track.
 - Full hash comparison (with all 6 normalization rules)
 - Field-level DeepCompare diffs
 - Bidirectional comparison (finds documents that only exist in target)
-- GridFS content MD5
+- GridFS content hash (SHA256, streamed via the GridFS download API - see
+  docs/TESTING.md section 9.1 for why this isn't MD5)
 
 **This is the final gate — only proceed to cutover once this passes.**
 
@@ -293,8 +306,9 @@ confirming the migration is broadly on track.
 |------|-------------|-------|
 | Users | Account list, password hashes (not compared directly) | 1 |
 | Roles | Each user's role list | 1 |
-| Custom roles | Custom role definitions | 1 |
-| Auth mechanism | SCRAM-SHA-256, etc. | 1 |
+| Custom roles | Custom role definitions, including inherited sub-roles | 1 |
+| Auth mechanism (server-wide) | Enabled mechanism list (`authenticationMechanisms`) | 1 |
+| Auth mechanism (per-user) | Each user's own `mechanisms` list (e.g. catches a user that's SCRAM-SHA-256-only on one side but offers both SHA-1+SHA-256 on the other, even with identical roles) | 1 |
 | LDAP servers | LDAP server settings | 1 |
 
 ### Cluster layer
@@ -303,10 +317,17 @@ confirming the migration is broadly on track.
 |------|-------------|-------|
 | Replica set protocolVersion | RS protocol version | 1 |
 | writeConcernMajorityJournalDefault | Write-acknowledgment setting | 1 |
-| slowOpThresholdMs | Slow-query threshold | 1 |
-| maxIncomingConnections | Max connection count | 1 |
+| Replica set topology | Aggregate member count, arbiter count, voting member count, hidden/delayed secondary count (not per-host identity - hostnames always differ between source and target) | 1 |
+| slowOpThresholdMs, maxIncomingConnections, notablescan, journalCommitInterval, cursorTimeoutMillis | 5 deliberately-configured server parameters with stable defaults across 4.4-8.0 (not version-gated, so a mismatch is real config drift) | 1 |
 | Shard count | (requires verify.sharding) | 1 |
 | Shard key | Per-collection shard key | 1 |
+| Version / FCV / default write concern | `buildInfo.version`, `featureCompatibilityVersion`, and `getDefaultRWConcern` on both sides - all informational only, never affect pass/fail (all three are version-driven by design, not config choices - treating a mismatch as an error would fail every cross-version run regardless of correctness), printed in every report header | 1 |
+
+Still not checked: most of MongoDB's hundreds of server parameters (5 of
+them are, see above) - a full fix needs a denylist-based comparison
+(check everything, explicitly exclude what's known to legitimately differ
+by version), deliberately not attempted without that groundwork. See
+docs/TESTING.md "Known limitations".
 
 ### Database layer
 
@@ -362,7 +383,7 @@ confirming the migration is broadly on track.
 | File count | | 1 |
 | filename | | 1 |
 | length | File size | 1 |
-| md5 | Content MD5 (Phase 3 only) | 3 |
+| content hash | SHA256 over the actual file bytes, streamed via the GridFS download API - not the `fs.files.md5` field, which the driver stopped writing years ago (Phase 3 only) | 3 |
 
 ### Data layer
 
@@ -466,6 +487,13 @@ type DiffDetail struct {
 | `MISSING_FIELD` | Target is missing a field | CDC dropped a field |
 | `EXTRA_FIELD` | Target has an extra field | CDC added a field |
 | `MISSING_DOC` | Target is missing the whole document | migration never copied it |
+| `ARRAY_LENGTH_MISMATCH` | An array of documents has a different element count | replay missed/duplicated an array element |
+
+Arrays of plain values (strings, numbers) are compared as a single
+normalized value, same as any other field. Arrays containing at least one
+document get recursed into element-by-element, with paths like
+`items[2].name` — so a difference nested inside one array element is
+reported precisely instead of as one opaque "the whole array differs."
 
 ---
 
@@ -526,7 +554,15 @@ Compare to mongosync: 8–16 GB
 Compare to Debezium:  4–8 GB
 ```
 
-### Throughput (estimated, 4 workers)
+This holds for the assumption it's built on — many small documents (~1KB),
+with batching keeping the concurrently-held set fixed. It does **not** hold
+per individual document: a single document is fully decoded, re-normalized,
+and JSON-marshaled for hashing (for both source and target), so memory
+scales with the size of the largest document encountered, not the documented
+baseline. Measured, not assumed: see `docs/TESTING.md`'s large-document
+findings (a single 12MB document drove peak RSS to ~917MB).
+
+### Throughput (estimated, 8 workers)
 
 | Data volume | Estimated time |
 |-------------|-----------------|
@@ -534,18 +570,38 @@ Compare to Debezium:  4–8 GB
 | 10,000,000 docs | 30–60 minutes |
 | 100,000,000 docs | 5–10 hours |
 
-These are design-time estimates; see `docs/TESTING.md` for actual measurements
-taken in a real cluster.
+These are design-time estimates, and — like the measured number below —
+assume the volume is spread across enough collections to keep every worker
+busy; see `docs/TESTING.md` for actual measurements taken in a real cluster.
+
+**Parallelism is per-collection, not per-document (with one exception).**
+`max_workers` controls how many *collections* are verified concurrently; a
+single collection was always processed by exactly one worker/cursor,
+however high `max_workers` was set (`docs/TESTING.md` measured ~530
+docs/sec for one collection this way — the throughput table above is an
+aggregate that assumes parallelism *across* collections, not a guarantee for
+any single one, regardless of size).
+
+The exception: a collection estimated above `range_split_threshold_docs` is
+now split into `range_workers_per_collection` concurrent `_id`-range
+sub-tasks (`internal/verifier/range_split.go`), so it's no longer bound to
+one worker's throughput. These range tasks share the same `max_workers` pool
+as cross-collection parallelism rather than adding to it, so a large
+collection splitting into many ranges can temporarily crowd out other
+collections in the same run — see README's "Large collections" section for
+the operational tradeoff. This has not been benchmarked at the scale that
+motivated it (1TB+) in this repo's test environment; the numbers above and
+in `docs/TESTING.md` predate it.
 
 ### Throttling
 
 ```
-rate_limit_ms: 10     # pause 10ms between every 500-doc batch
+rate_limit_ms: 2      # pause between every batch_size-doc batch
                       # reduces pressure on the database
                       # 0 = full speed
 
-max_workers: 4        # parallel collections
-                      # more workers = faster but more DB pressure
+max_workers: 8        # parallel collections (and, for a split collection,
+                      # the same pool its range sub-tasks share)
 ```
 
 ### Retry behavior
@@ -856,10 +912,12 @@ mydb.orders, VALUE_DIFF, 64a1b2c4..., price, float64, float64, f:99.9000000000, 
 | `--phase` | 1 / 2 / 3 / all | all |
 | `--resume` | resume from checkpoint | false |
 | `--config` | path to config file | config.yaml |
-| `--sample` | sample rate (0.1=10%) | 0 (full scan) |
+| `--sample` | override `sample_rate` (0-1) for Phase 2; **ignored by Phase 3**, which always does a full, unsampled scan | -1 (use config's `sample_rate`) |
 | `--dry-run` | scan only, no comparison | false |
 | `--include-ns` | only verify this NS | (all) |
 | `--exclude-ns` | exclude this NS | (none) |
+| `--auto-repair` | after Phase 3, copy its diffs (missing/different docs) from source to target — **writes to the target cluster** | false |
+| `--export-csv` | export every diff to a CSV file (path, or `auto` for a timestamped name) | (disabled) |
 
 ### Namespace filter syntax
 
@@ -878,7 +936,8 @@ and `config.NSFilter` in `internal/config/config.go`.
 ### Checkpoint/resume mechanism
 
 ```
-Every 1,000 documents, a checkpoint is saved to checkpoints.json:
+Every 1,000 documents, a checkpoint is saved to a job-scoped file
+(checkpoints_<hash of source_uri+target_uri>.json, internal/utils/checkpoint.go):
 {
   "mydb.users": "64a1b2c3d4e5f6a7b8c9d0e1",
   "mydb.orders": "64a1b2c3d4e5f6a7b8c9d0e2"
@@ -939,7 +998,7 @@ monitor_uri: "mongodb://monitor:27017/"
 ### Tests
 
 ```bash
-go test ./test/... -v
+go test ./... -v
 
 # Sample output:
 # --- PASS: TestDocHash_SameDocSameHash (0.00s)
@@ -1027,7 +1086,7 @@ journalctl -u mongogate -f
 | 20 | Wildcard index | projection settings |
 | 21 | View definitions | viewOn, pipeline, collation |
 | 22 | GridFS metadata | count, filename, length |
-| 23 | GridFS MD5 | content integrity (Phase 3) |
+| 23 | GridFS content hash | SHA256 content integrity, streamed (Phase 3) |
 | 24 | Count comparison | tagged estimate/exact |
 | 25 | Hash comparison | full SHA256 |
 | 26 | Field type verification | BSON types |
@@ -1129,7 +1188,7 @@ safety limit.
 
 Yes, because it:
 - reads from secondaries (`readPreference=secondaryPreferred`)
-- rate-limits itself (10ms per batch)
+- rate-limits itself (`rate_limit_ms`, configurable)
 - uses an independent connection pool
 - only reads from source, never writes to it
 

@@ -57,7 +57,9 @@ func VerifyCollections(ctx context.Context, src, tgt *mongo.Client,
 	fmt.Printf("\n📁 [Phase1] Verifying [%s] collections\n", dbName)
 	var errors []string
 
-	inScope := func(col string) bool { return nsFilter == nil || nsFilter(dbName, col) }
+	inScope := func(col string) bool {
+		return (nsFilter == nil || nsFilter(dbName, col)) && !isOperationalSystemCollection(col)
+	}
 	srcCols := filterStrings(listCollections(ctx, src, dbName), inScope)
 	tgtCols := filterStrings(listCollections(ctx, tgt, dbName), inScope)
 	srcSet := toSet(srcCols)
@@ -114,7 +116,9 @@ func getCollectionOptions(ctx context.Context, client *mongo.Client,
 
 	cur, err := client.Database(dbName).ListCollections(ctx,
 		bson.M{"name": colName})
-	if err != nil { return bson.M{} }
+	if err != nil {
+		return bson.M{}
+	}
 	defer cur.Close(ctx)
 	if cur.Next(ctx) {
 		var doc bson.M
@@ -147,9 +151,26 @@ func listCollections(ctx context.Context, client *mongo.Client, dbName string) [
 	return names
 }
 
+// isOperationalSystemCollection matches per-server diagnostic/operational
+// collections that listCollections happily returns but that were never
+// migrated application data - they record what that specific server
+// happened to observe (e.g. system.profile logs the profiler's own local
+// query history; system.js holds server-local stored functions), so
+// content, and even existence, is expected to differ between source and
+// target regardless of migration correctness. Enabling the profiler on
+// only one side for diagnosis (common) would otherwise surface as a false
+// "missing/extra collection" here and, if enabled on both, as bogus
+// per-document diffs in Phase 2/3 - excluded here so it's never even a
+// candidate for either check.
+func isOperationalSystemCollection(col string) bool {
+	return col == "system.profile" || col == "system.js"
+}
+
 func toSet(ss []string) map[string]bool {
 	m := make(map[string]bool, len(ss))
-	for _, s := range ss { m[s] = true }
+	for _, s := range ss {
+		m[s] = true
+	}
 	return m
 }
 
@@ -165,7 +186,9 @@ func filterStrings(ss []string, keep func(string) bool) []string {
 
 func printStatus(label string, passed bool, detail string) {
 	status := "✅ PASS"
-	if !passed { status = "❌ FAIL" }
+	if !passed {
+		status = "❌ FAIL"
+	}
 	if detail != "" {
 		fmt.Printf("  %s %s (%s)\n", status, label, detail)
 	} else {

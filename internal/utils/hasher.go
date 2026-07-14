@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -100,14 +101,21 @@ func normalizeValue(v interface{}, opts HashOptions) interface{} {
 
 	// ── float64: fixed precision ──
 	case float64:
+		if val == 0 {
+			val = 0 // collapse -0.0 to 0.0; they're equal but format differently
+		}
 		if opts.NormalizeFloatPrecision > 0 {
 			return fmt.Sprintf("f:%.*f", opts.NormalizeFloatPrecision, val)
 		}
 		return val
 
 	case float32:
+		f := float64(val)
+		if f == 0 {
+			f = 0 // collapse -0.0 to 0.0; they're equal but format differently
+		}
 		if opts.NormalizeFloatPrecision > 0 {
-			return fmt.Sprintf("f:%.*f", opts.NormalizeFloatPrecision, float64(val))
+			return fmt.Sprintf("f:%.*f", opts.NormalizeFloatPrecision, f)
 		}
 		return val
 
@@ -312,6 +320,47 @@ func deepDiff(src, tgt bson.M, path string, opts HashOptions) []DiffDetail {
 			}
 		}
 
+		// ── Recurse into arrays of documents, index by index ──
+		// Plain-value arrays (tags, scores, embeddings, ...) are left to the
+		// normalized whole-array comparison below; an array containing at
+		// least one document gets per-element paths like "items[2].name"
+		// instead of one opaque "the whole array differs".
+		if svArr, tvArr, ok := bothArraysOfDocs(sv, tv); ok {
+			if len(svArr) != len(tvArr) {
+				diffs = append(diffs, DiffDetail{
+					Path:      fullPath,
+					SrcType:   "array",
+					TgtType:   "array",
+					SrcValue:  fmt.Sprintf("len=%d", len(svArr)),
+					TgtValue:  fmt.Sprintf("len=%d", len(tvArr)),
+					IssueType: "ARRAY_LENGTH_MISMATCH",
+				})
+				continue
+			}
+			for i := range svArr {
+				elemPath := fmt.Sprintf("%s[%d]", fullPath, i)
+				svElem, svIsDoc := svArr[i].(bson.M)
+				tvElem, tvIsDoc := tvArr[i].(bson.M)
+				if svIsDoc && tvIsDoc {
+					diffs = append(diffs, deepDiff(svElem, tvElem, elemPath, opts)...)
+					continue
+				}
+				elemSrcNorm := fmt.Sprintf("%v", normalizeValue(svArr[i], opts))
+				elemTgtNorm := fmt.Sprintf("%v", normalizeValue(tvArr[i], opts))
+				if elemSrcNorm != elemTgtNorm {
+					diffs = append(diffs, DiffDetail{
+						Path:      elemPath,
+						SrcType:   typeName(svArr[i]),
+						TgtType:   typeName(tvArr[i]),
+						SrcValue:  truncate(elemSrcNorm),
+						TgtValue:  truncate(elemTgtNorm),
+						IssueType: "VALUE_DIFF",
+					})
+				}
+			}
+			continue
+		}
+
 		// ── Value comparison using normalized values ──
 		srcNorm := fmt.Sprintf("%v", normalizeValue(sv, opts))
 		tgtNorm := fmt.Sprintf("%v", normalizeValue(tv, opts))
@@ -346,6 +395,42 @@ func deepDiff(src, tgt bson.M, path string, opts HashOptions) []DiffDetail {
 		}
 	}
 	return diffs
+}
+
+// bothArraysOfDocs returns sv/tv as []interface{} when both are arrays and
+// at least one holds a document element - the signal that per-element
+// recursion will produce a more precise diff than comparing the whole array
+// as one opaque normalized value.
+func bothArraysOfDocs(sv, tv interface{}) ([]interface{}, []interface{}, bool) {
+	svArr, svOK := toInterfaceSlice(sv)
+	tvArr, tvOK := toInterfaceSlice(tv)
+	if !svOK || !tvOK {
+		return nil, nil, false
+	}
+	if !containsDoc(svArr) && !containsDoc(tvArr) {
+		return nil, nil, false
+	}
+	return svArr, tvArr, true
+}
+
+func toInterfaceSlice(v interface{}) ([]interface{}, bool) {
+	switch a := v.(type) {
+	case primitive.A:
+		return []interface{}(a), true
+	case []interface{}:
+		return a, true
+	default:
+		return nil, false
+	}
+}
+
+func containsDoc(arr []interface{}) bool {
+	for _, e := range arr {
+		if _, ok := e.(bson.M); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // typeName returns a human-readable type name.
@@ -388,10 +473,12 @@ func typeName(v interface{}) string {
 	}
 }
 
-// truncate shortens overly long values so logs don't explode.
+// truncate shortens overly long values so logs don't explode. Counts and
+// slices by rune, not byte: a byte-offset slice can land in the middle of a
+// multi-byte UTF-8 character (Chinese, emoji, etc.) and corrupt the output.
 func truncate(s string) string {
-	if len(s) > 120 {
-		return s[:120] + "...(truncated)"
+	if utf8.RuneCountInString(s) > 120 {
+		return string([]rune(s)[:120]) + "...(truncated)"
 	}
 	return s
 }

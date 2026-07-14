@@ -19,8 +19,10 @@ func VerifyIndexes(ctx context.Context, src, tgt *mongo.Client,
 
 	var errors []string
 
+	// _id_ is no longer skipped: a clustered collection's defining
+	// characteristic (unique/clustered flags) lives only on this index, so
+	// skipping it by name silently passed plain-vs-clustered mismatches.
 	for name, si := range srcIdxs {
-		if name == "_id_" { continue }
 		ti, ok := tgtIdxs[name]
 		if !ok {
 			errors = append(errors, fmt.Sprintf("❌ Missing index: %s", name))
@@ -29,7 +31,6 @@ func VerifyIndexes(ctx context.Context, src, tgt *mongo.Client,
 		errors = append(errors, compareIndex(name, si, ti)...)
 	}
 	for name := range tgtIdxs {
-		if name == "_id_" { continue }
 		if _, ok := srcIdxs[name]; !ok {
 			errors = append(errors, fmt.Sprintf("⚠️  Extra index in target: %s", name))
 		}
@@ -39,7 +40,9 @@ func VerifyIndexes(ctx context.Context, src, tgt *mongo.Client,
 	rpt.SetIndex(ns, res)
 	if !res.Passed {
 		fmt.Printf("  ❌ Index [%s]\n", ns)
-		for _, e := range errors { fmt.Printf("     %s\n", e) }
+		for _, e := range errors {
+			fmt.Printf("     %s\n", e)
+		}
 	}
 }
 
@@ -48,16 +51,17 @@ func compareIndex(name string, si, ti bson.M) []string {
 	fields := []string{
 		"key",
 		"unique",
+		"clustered",
 		"sparse",
 		"hidden",
-		"expireAfterSeconds",    // TTL
+		"expireAfterSeconds",      // TTL
 		"partialFilterExpression", // Partial
-		"weights",               // Text index
+		"weights",                 // Text index
 		"collation",
-		"wildcardProjection",    // Wildcard
-		"2dsphereIndexVersion",  // Geo
-		"default_language",      // Text
-		"language_override",     // Text
+		"wildcardProjection",   // Wildcard
+		"2dsphereIndexVersion", // Geo
+		"default_language",     // Text
+		"language_override",    // Text
 	}
 	return compareBSONFields(fmt.Sprintf("Index [%s]", name), fields, si, ti)
 }
@@ -66,7 +70,9 @@ func getIndexes(ctx context.Context, client *mongo.Client,
 	dbName, colName string) map[string]bson.M {
 
 	cur, err := client.Database(dbName).Collection(colName).Indexes().List(ctx)
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer cur.Close(ctx)
 	result := make(map[string]bson.M)
 	for cur.Next(ctx) {

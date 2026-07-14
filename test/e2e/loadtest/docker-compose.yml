@@ -1,0 +1,131 @@
+services:
+  # ── Source: hammered by loadgen write, needs a replica set for
+  #    loadgen's change-stream-based mirror to work ──
+  source:
+    image: mongo:7.0
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.runCommand('ping').ok\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [loadtest_net]
+
+  # One-shot: initiates the single-node replica set. Idempotent - ignores
+  # "already initialized" so re-running `docker compose up` after a restart
+  # doesn't fail.
+  source-init:
+    image: mongo:7.0
+    depends_on:
+      source:
+        condition: service_healthy
+    command:
+      - mongosh
+      - --host=source
+      - --quiet
+      - --eval
+      - |
+        try { rs.initiate() } catch (e) {
+          if (!/already initialized/.test(e.message)) { throw e }
+        }
+    networks: [loadtest_net]
+
+  # ── Target: what mongogate compares source against ──
+  target:
+    image: mongo:7.0
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.runCommand('ping').ok\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [loadtest_net]
+
+  # ── Monitor: time series store for mongogate's own progress metrics ──
+  monitor:
+    image: mongo:7.0
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.runCommand('ping').ok\" || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [loadtest_net]
+
+  # ── Load: hammers source.migtest.live_col at LOAD_RATE ops/sec ──
+  loadgen-write:
+    build:
+      context: ../../..
+      dockerfile: test/e2e/Dockerfile.tools
+    depends_on:
+      source-init:
+        condition: service_completed_successfully
+    environment:
+      # Keep LOAD_RATE below 1/MIRROR_LAG: the mirror replays serially,
+      # sleeping MIRROR_LAG per event, so its throughput ceiling is ~1/lag
+      # events/sec. Exceed that and target falls behind without bound -
+      # verification then correctly reports ever-growing missing counts,
+      # which is a statement about these knobs, not about mongogate.
+      LOAD_RATE: ${LOAD_RATE:-30}
+      LOAD_DURATION: ${LOAD_DURATION:-24h}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - ./loadgen write --uri "mongodb://source:27017/?replicaSet=rs0" --db migtest --col live_col --rate "$$LOAD_RATE" --duration "$$LOAD_DURATION"
+    restart: on-failure
+    networks: [loadtest_net]
+
+  # ── Mirror: stands in for a real CDC pipeline, replaying source's
+  #    change stream to target with lag and a small deliberate drop rate
+  #    so the verifier's diff/missing gauges have something to show ──
+  loadgen-mirror:
+    build:
+      context: ../../..
+      dockerfile: test/e2e/Dockerfile.tools
+    depends_on:
+      source-init:
+        condition: service_completed_successfully
+      target:
+        condition: service_healthy
+    environment:
+      LOAD_DURATION: ${LOAD_DURATION:-24h}
+      MIRROR_LAG: ${MIRROR_LAG:-20ms}
+      MIRROR_DROP_RATE: ${MIRROR_DROP_RATE:-0.02}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - ./loadgen mirror --src "mongodb://source:27017/?replicaSet=rs0" --tgt "mongodb://target:27017" --db migtest --col live_col --lag "$$MIRROR_LAG" --drop-rate "$$MIRROR_DROP_RATE" --duration "$$LOAD_DURATION"
+    restart: on-failure
+    networks: [loadtest_net]
+
+  # ── mongogate: --loop-interval keeps one long-lived process repeating
+  #    Phase 2 passes, so /metrics and the HTTP API stay up continuously
+  #    while the load runs (a shell-level restart loop would kill and
+  #    rebind the listener every pass, giving Prometheus almost nothing
+  #    to scrape - see the flag's doc comment in cmd/mongogate/main.go).
+  mongogate:
+    build:
+      context: ../../..
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      source-init:
+        condition: service_completed_successfully
+      target:
+        condition: service_healthy
+      monitor:
+        condition: service_healthy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--phase", "2", "--loop-interval", "${LOOP_INTERVAL:-5s}"]
+    ports:
+      - "9090:9090"
+      - "8080:8080"
+    networks: [loadtest_net]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    networks: [loadtest_net]
+
+networks:
+  loadtest_net:
+    driver: bridge

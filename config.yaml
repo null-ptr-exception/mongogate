@@ -3,17 +3,32 @@ target_uri: "mongodb://target:27017/?readPreference=secondaryPreferred"
 monitor_uri: "mongodb://monitor:27017/"
 
 # Performance controls
-batch_size: 500
-max_workers: 4
-rate_limit_ms: 10
+# batch_size/rate_limit_ms are not universal - tune them to what your
+# source/target clusters can actually absorb under load, not just these
+# defaults. 2000/2 works well against a moderately-provisioned replica set;
+# a smaller/shared cluster may need to go back down toward 500/10.
+batch_size: 2000
+max_workers: 8
+rate_limit_ms: 2
 timeout_secs: 30
 retry_count: 3
 retry_wait_ms: 500
+
+# Large-collection handling: a collection whose estimated document count
+# exceeds range_split_threshold_docs is split into range_workers_per_collection
+# _id-range sub-tasks that scan concurrently (sharing the same max_workers
+# pool, not on top of it - one huge collection can temporarily occupy most
+# workers, other collections queue behind it). See README "Large collections"
+# section.
+range_split_threshold_docs: 2000000
+range_workers_per_collection: 8
 
 # Namespace filtering
 skip_dbs:
   - local
   - config
+  - admin   # users/roles/replset config are already verified by VerifyAuth/VerifyCluster;
+            # raw-comparing admin.system.users always false-positives (fresh SCRAM salt per side)
 # include_ns:           # only verify these (empty = everything)
 #   - mydb.users
 #   - mydb.*
@@ -21,6 +36,9 @@ skip_dbs:
 #   - mydb.logs
 
 # Verification switches
+# Queryable Encryption has no switch here on purpose - it's not a missing
+# feature, it's a ceiling on what hash-based comparison can ever tell you
+# about encrypted data. See docs/TESTING.md "Known limitations".
 verify:
   auth: true
   cluster: true
@@ -29,8 +47,7 @@ verify:
   data: true
   gridfs: true
   views: true
-  sharding: false
-  encryption: false
+  sharding: false        # turn on only if source/target are sharded clusters
   bidirectional: true   # also scan target → source (finds extra docs in target)
 
 phase2_lag_threshold_seconds: 10

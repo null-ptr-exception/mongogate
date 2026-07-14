@@ -54,6 +54,12 @@ func ExportDiffCSV(rpt *report.Report, path string) error {
 				ns, "DIFFERENT_DOC", sample, "", "", "", "", "", now,
 			})
 		}
+		// Docs that only exist in target (bidirectional scan)
+		for _, id := range result.ExtraInTargetSample {
+			_ = w.Write([]string{
+				ns, "EXTRA_IN_TARGET", id, "", "", "", "", "", now,
+			})
+		}
 		// Field-level errors
 		for _, e := range result.FieldErrors {
 			_ = w.Write([]string{

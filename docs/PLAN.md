@@ -3,6 +3,13 @@
 Version: 1.0
 Date: 2026-06-17
 
+This is the original pre-implementation project plan, kept as written -
+not updated to track what was actually built. For current architecture see
+[`docs/DESIGN.md`](DESIGN.md); for what's actually been confirmed against
+a real cluster (including several things this plan assumed that turned
+out not to hold, like there ever having been a working binary) see
+[`docs/TESTING.md`](TESTING.md).
+
 ---
 
 ## 1. Background & Goals
@@ -261,7 +268,8 @@ verify:
   data: true
   gridfs: true
   sharding: false
-  encryption: false
+  # encryption: false - removed; see docs/TESTING.md Known limitations,
+  # this was a dead flag and copying it into a real config now does nothing
 
 phase2_lag_threshold_seconds: 10
 sample_rate: 0.1

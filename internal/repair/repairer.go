@@ -18,10 +18,10 @@ type Repairer struct {
 }
 
 type RepairResult struct {
-	NS          string
-	Fixed       int
-	Failed      int
-	Errors      []string
+	NS     string
+	Fixed  int
+	Failed int
+	Errors []string
 }
 
 func New(src, tgt *mongo.Client) *Repairer {

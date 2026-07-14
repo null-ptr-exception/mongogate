@@ -18,14 +18,14 @@ type HashOptions struct {
 }
 
 type AlertConfig struct {
-	Enabled        bool   `yaml:"enabled"`
-	SlackWebhook   string `yaml:"slack_webhook"`
-	EmailSMTP      string `yaml:"email_smtp"`
-	EmailFrom      string `yaml:"email_from"`
-	EmailTo        []string `yaml:"email_to"`
-	MissingThreshold   int `yaml:"missing_threshold"`    // fires when missing > N
-	DifferentThreshold int `yaml:"different_threshold"`  // fires when different > N
-	StuckMinutes       int `yaml:"stuck_minutes"`        // fires when progress hasn't moved in N minutes
+	Enabled            bool     `yaml:"enabled"`
+	SlackWebhook       string   `yaml:"slack_webhook"`
+	EmailSMTP          string   `yaml:"email_smtp"`
+	EmailFrom          string   `yaml:"email_from"`
+	EmailTo            []string `yaml:"email_to"`
+	MissingThreshold   int      `yaml:"missing_threshold"`   // fires when missing > N
+	DifferentThreshold int      `yaml:"different_threshold"` // fires when different > N
+	StuckMinutes       int      `yaml:"stuck_minutes"`       // fires when progress hasn't moved in N minutes
 }
 
 type Config struct {
@@ -40,32 +40,42 @@ type Config struct {
 	RetryCount  int `yaml:"retry_count"`
 	RetryWaitMS int `yaml:"retry_wait_ms"`
 
-	SkipDBs    []string `yaml:"skip_dbs"`
-	IncludeNS  []string `yaml:"include_ns"`  // format: "db.col" or "db.*"
-	ExcludeNS  []string `yaml:"exclude_ns"`
+	SkipDBs   []string `yaml:"skip_dbs"`
+	IncludeNS []string `yaml:"include_ns"` // format: "db.col" or "db.*"
+	ExcludeNS []string `yaml:"exclude_ns"`
 
+	// Queryable Encryption has no toggle here on purpose: it's not a
+	// missing feature, it's a ceiling on what hash-based comparison can
+	// ever tell you about encrypted data (see docs/TESTING.md "Known
+	// limitations") - a flag that did nothing would just be misleading.
 	Verify struct {
-		Auth       bool `yaml:"auth"`
-		Cluster    bool `yaml:"cluster"`
-		Schema     bool `yaml:"schema"`
-		Index      bool `yaml:"index"`
-		Data       bool `yaml:"data"`
-		GridFS     bool `yaml:"gridfs"`
-		Sharding   bool `yaml:"sharding"`
-		Encryption bool `yaml:"encryption"`
-		Views      bool `yaml:"views"`
+		Auth          bool `yaml:"auth"`
+		Cluster       bool `yaml:"cluster"`
+		Schema        bool `yaml:"schema"`
+		Index         bool `yaml:"index"`
+		Data          bool `yaml:"data"`
+		GridFS        bool `yaml:"gridfs"`
+		Sharding      bool `yaml:"sharding"`
+		Views         bool `yaml:"views"`
 		Bidirectional bool `yaml:"bidirectional"` // also scan target → source
 	} `yaml:"verify"`
 
 	Phase2LagThresholdSeconds int     `yaml:"phase2_lag_threshold_seconds"`
 	SampleRate                float64 `yaml:"sample_rate"`
 
+	// RangeSplitThresholdDocs: collections estimated above this size are
+	// split into RangeWorkersPerCollection concurrent _id-range sub-tasks
+	// instead of being scanned by a single cursor/goroutine. See
+	// internal/verifier/range_split.go.
+	RangeSplitThresholdDocs   int64 `yaml:"range_split_threshold_docs"`
+	RangeWorkersPerCollection int   `yaml:"range_workers_per_collection"`
+
 	HashOptions HashOptions `yaml:"hash_options"`
 	Alert       AlertConfig `yaml:"alert"`
 
 	// Execution mode
-	DryRun    bool   `yaml:"dry_run"`
-	AutoRepair bool  `yaml:"auto_repair"`  // automatically repair diffs found
+	DryRun     bool   `yaml:"dry_run"`
+	AutoRepair bool   `yaml:"auto_repair"` // automatically repair diffs found
 	ExportCSV  string `yaml:"export_csv"`  // diff export path
 
 	// HTTP API
@@ -90,24 +100,33 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	cfg := &Config{
 		BatchSize:                 500,
-		MaxWorkers:                4,
+		MaxWorkers:                8,
 		RateLimitMS:               10,
 		TimeoutSecs:               30,
 		RetryCount:                3,
 		RetryWaitMS:               500,
 		Phase2LagThresholdSeconds: 10,
 		SampleRate:                0.1,
-		SkipDBs:                   []string{"local", "config"},
-		HTTPPort:                  0,
-		PrometheusPort:            0,
+		RangeSplitThresholdDocs:   2_000_000,
+		RangeWorkersPerCollection: 8,
+		// "admin" is skipped by default: its meaningful content (users,
+		// roles, replica set config) is already covered by dedicated,
+		// purpose-built checks (VerifyAuth, VerifyCluster) via proper admin
+		// commands. Generic raw-document comparison of admin.system.users
+		// guarantees false positives - SCRAM credentials are freshly salted
+		// per createUser call, so the same password produces different
+		// stored bytes on each side even on a 100% correct migration.
+		SkipDBs:        []string{"local", "config", "admin"},
+		HTTPPort:       0,
+		PrometheusPort: 0,
 	}
-	cfg.Verify.Auth      = true
-	cfg.Verify.Cluster   = true
-	cfg.Verify.Schema    = true
-	cfg.Verify.Index     = true
-	cfg.Verify.Data      = true
-	cfg.Verify.GridFS    = true
-	cfg.Verify.Views     = true
+	cfg.Verify.Auth = true
+	cfg.Verify.Cluster = true
+	cfg.Verify.Schema = true
+	cfg.Verify.Index = true
+	cfg.Verify.Data = true
+	cfg.Verify.GridFS = true
+	cfg.Verify.Views = true
 	cfg.Verify.Bidirectional = true
 	cfg.HashOptions = HashOptions{
 		NormalizeDatetime:       true,
@@ -126,9 +145,15 @@ func defaults() *Config {
 }
 
 func validate(cfg *Config) error {
-	if cfg.SourceURI == "" { return fmt.Errorf("source_uri is required") }
-	if cfg.TargetURI == "" { return fmt.Errorf("target_uri is required") }
-	if cfg.MonitorURI == "" { return fmt.Errorf("monitor_uri is required") }
+	if cfg.SourceURI == "" {
+		return fmt.Errorf("source_uri is required")
+	}
+	if cfg.TargetURI == "" {
+		return fmt.Errorf("target_uri is required")
+	}
+	if cfg.MonitorURI == "" {
+		return fmt.Errorf("monitor_uri is required")
+	}
 	if cfg.BatchSize < 1 || cfg.BatchSize > 10000 {
 		return fmt.Errorf("batch_size must be between 1 and 10000")
 	}
@@ -137,6 +162,15 @@ func validate(cfg *Config) error {
 	}
 	if cfg.SampleRate < 0 || cfg.SampleRate > 1 {
 		return fmt.Errorf("sample_rate must be between 0 and 1")
+	}
+	if cfg.RangeSplitThresholdDocs < 1 {
+		return fmt.Errorf("range_split_threshold_docs must be >= 1")
+	}
+	// range workers share max_workers' pool rather than adding on top of it
+	// (see docs/DESIGN.md) - a value above max_workers could never actually
+	// be reached and just misleads whoever reads the config.
+	if cfg.RangeWorkersPerCollection < 1 || cfg.RangeWorkersPerCollection > cfg.MaxWorkers {
+		return fmt.Errorf("range_workers_per_collection must be between 1 and max_workers (%d)", cfg.MaxWorkers)
 	}
 	return nil
 }
@@ -166,7 +200,9 @@ checkExclude:
 }
 
 func matchNS(pattern, ns, dbName string) bool {
-	if pattern == ns { return true }
+	if pattern == ns {
+		return true
+	}
 	// "db.*" matches every collection in that db
 	if strings.HasSuffix(pattern, ".*") {
 		prefix := strings.TrimSuffix(pattern, ".*")

@@ -1,0 +1,322 @@
+name: E2E (kind)
+
+# ci.yml only ever ran go build/vet/test/lint - none of that touches a real
+# MongoDB cluster, so every finding documented in docs/TESTING.md (sections
+# 1-11) was only ever confirmed by hand. This workflow turns the two
+# highest-value manual scenarios into automated regression tests:
+#   1. happy-path: same-version baseline must pass, and a deliberately
+#      injected structural drift must be caught (not silently missed).
+#   2. cross-version-matrix: each of mongo:4.4/5.0/6.0/7.0 as source against
+#      an 8.0 target must reproduce exactly the findings already documented
+#      in docs/TESTING.md section 10 - no more, no fewer. A regression here
+#      means either a real detection bug was reintroduced, or a fix
+#      legitimately changed the boundary and docs/TESTING.md needs updating
+#      to match (not the other way around).
+
+on:
+  push:
+    branches: [main, add-e2e-testing]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  KIND_VERSION: v0.32.0
+  # Test-only credential for an ephemeral kind cluster, never a real
+  # secret - still one variable, not copy-pasted into a dozen places where
+  # a typo could silently diverge it from setup.sh's own copy. Workflow-level
+  # env is inherited by every job/step below, including setup.sh (which
+  # reads the same names with the same defaults if unset).
+  MONGO_ROOT_USER: root
+  MONGO_ROOT_PASSWORD: rootpass123
+
+jobs:
+  happy-path:
+    name: Same-version happy path + structural drift detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install kind and kubectl
+        run: |
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          curl -Lo ./kubectl "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Bring up the kind cluster only (no MongoDB yet)
+        working-directory: test/e2e/scripts
+        run: |
+          kind create cluster --config ../kind/cluster-config.yaml
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Build the tools image
+        # Done before any mongod starts, not after: go build/go mod download
+        # is CPU-heavy, and running it concurrently with two already-live
+        # 3-node replica sets starved them of CPU on a standard GHA runner -
+        # confirmed live, this caused sustained (50+ second) AuthenticationFailed
+        # against a node mid-election, not a quick replication blip.
+        run: docker build -f test/e2e/Dockerfile.tools -t mongogate-e2e-tools:latest .
+
+      - name: Bring up E2E environment (source forced to match target - true same-version baseline)
+        working-directory: test/e2e/scripts
+        env:
+          SOURCE_MONGO_VERSION: "8.0"
+        run: bash setup.sh
+
+      - name: Load tools image into the cluster
+        run: kind load docker-image mongogate-e2e-tools:latest --name mongogate-e2e
+
+      - name: Deploy e2e-tools pod
+        run: |
+          kubectl apply -f test/e2e/kind/monitor/tools-pod.yaml
+          kubectl -n mongogate-test wait --for=condition=Ready pod/e2e-tools --timeout=60s
+
+      - name: Write test config (matches the recommended default in config.yaml)
+        run: |
+          cat > /tmp/ci-config.yaml <<YAML
+          source_uri: "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          target_uri: "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          monitor_uri: "mongodb://monitor-mongo.mongogate-test.svc.cluster.local:27017/"
+          skip_dbs: [local, config, admin]
+          verify:
+            auth: true
+            cluster: true
+            schema: true
+            index: true
+            data: true
+            gridfs: true
+            views: true
+            sharding: false
+            bidirectional: true
+          sample_rate: 0.1
+          http_port: 0
+          prometheus_port: 0
+          alert:
+            enabled: false
+          hash_options:
+            normalize_datetime: true
+            normalize_float_precision: 10
+            normalize_decimal128: true
+            sort_arrays: false
+            check_binary_subtype: true
+            strict_objectid: true
+          YAML
+          kubectl -n mongogate-test cp /tmp/ci-config.yaml e2e-tools:/app/config.yaml
+
+      - name: Seed identical baseline on both sides
+        run: |
+          SRC="mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          TGT="mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          # Reordering the build step (previous commit) didn't fully close
+          # this either - still recurs. Dumping real replica set state on
+          # every failed attempt instead of guessing again: if rs.status()
+          # itself can't authenticate, the problem is cluster-wide, not
+          # loadgen-specific; if it can, the member states/health below
+          # will show what's actually wrong.
+          dump_diag() {
+            for ns in mongo-source mongo-target; do
+              echo "--- DIAGNOSTIC: $ns rs.status() ---"
+              kubectl -n "$ns" exec mongo-0 -- mongosh --quiet -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || kubectl -n "$ns" exec mongo-0 -- mongo --quiet -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || echo "(failed to query $ns directly too - cluster-wide issue, not loadgen-specific)"
+            done
+          }
+          retry() {
+            local desc="$1"; shift
+            for i in $(seq 1 10); do
+              if "$@"; then return 0; fi
+              echo "::warning::$desc attempt $i failed, retrying in 15s..."
+              dump_diag
+              sleep 15
+            done
+            echo "::error::$desc failed after 10 attempts"
+            return 1
+          }
+          retry "seed-baseline" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
+          retry "seed-users" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-users --src "$SRC" --tgt "$TGT"
+
+      - name: Phase 1 must pass on an identical same-version baseline
+        run: kubectl -n mongogate-test exec e2e-tools -- /app/mongogate --phase 1
+
+      - name: Phase 3 must pass on an identical same-version baseline
+        run: kubectl -n mongogate-test exec e2e-tools -- /app/mongogate --phase 3
+
+      - name: Inject a real structural drift, confirm Phase 1 catches it
+        run: |
+          kubectl -n mongo-target exec mongo-0 -- mongosh --quiet -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" \
+            --authenticationDatabase admin migtest --eval "db.plain_docs.dropIndex('name_1')"
+          if kubectl -n mongogate-test exec e2e-tools -- /app/mongogate --phase 1; then
+            echo "::error::Phase 1 passed after a real index was dropped on target - structural drift detection regressed"
+            exit 1
+          fi
+          echo "Correctly detected the injected drift (non-zero exit, as expected)"
+
+      - name: Teardown
+        if: always()
+        working-directory: test/e2e/scripts
+        run: bash teardown.sh
+
+  cross-version-matrix:
+    name: "Cross-version: mongo:${{ matrix.source_version }} source vs 8.0 target"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        source_version: ["4.4", "5.0", "6.0", "7.0"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install kind and kubectl
+        run: |
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          curl -Lo ./kubectl "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+
+      - name: Bring up the kind cluster only (no MongoDB yet)
+        working-directory: test/e2e/scripts
+        run: |
+          kind create cluster --config ../kind/cluster-config.yaml
+          kubectl wait --for=condition=Ready node --all --timeout=120s
+
+      - name: Build the tools image
+        # See the happy-path job for why this runs before any mongod starts.
+        run: docker build -f test/e2e/Dockerfile.tools -t mongogate-e2e-tools:latest .
+
+      - name: Bring up E2E environment (source = this matrix entry's version)
+        working-directory: test/e2e/scripts
+        env:
+          SOURCE_MONGO_VERSION: ${{ matrix.source_version }}
+        run: bash setup.sh
+
+      - name: Load tools image into the cluster
+        run: kind load docker-image mongogate-e2e-tools:latest --name mongogate-e2e
+
+      - name: Deploy e2e-tools pod
+        run: |
+          kubectl apply -f test/e2e/kind/monitor/tools-pod.yaml
+          kubectl -n mongogate-test wait --for=condition=Ready pod/e2e-tools --timeout=60s
+
+      - name: Write test config
+        run: |
+          cat > /tmp/ci-config.yaml <<YAML
+          source_uri: "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          target_uri: "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          monitor_uri: "mongodb://monitor-mongo.mongogate-test.svc.cluster.local:27017/"
+          skip_dbs: [local, config, admin]
+          verify:
+            auth: true
+            cluster: true
+            schema: true
+            index: true
+            data: true
+            gridfs: true
+            views: true
+            sharding: false
+            bidirectional: true
+          sample_rate: 0.1
+          http_port: 0
+          prometheus_port: 0
+          alert:
+            enabled: false
+          hash_options:
+            normalize_datetime: true
+            normalize_float_precision: 10
+            normalize_decimal128: true
+            sort_arrays: false
+            check_binary_subtype: true
+            strict_objectid: true
+          YAML
+          kubectl -n mongogate-test cp /tmp/ci-config.yaml e2e-tools:/app/config.yaml
+
+      - name: Seed baseline
+        run: |
+          SRC="mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-source.svc.cluster.local,mongo-1.mongo-headless.mongo-source.svc.cluster.local,mongo-2.mongo-headless.mongo-source.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          TGT="mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongo-0.mongo-headless.mongo-target.svc.cluster.local,mongo-1.mongo-headless.mongo-target.svc.cluster.local,mongo-2.mongo-headless.mongo-target.svc.cluster.local/?replicaSet=rs0&authSource=admin"
+          # See the happy-path job's "Seed identical baseline" step for the
+          # full history - readiness checks and build reordering both
+          # helped but didn't fully close this. Dumping real replica set
+          # state on every failed attempt instead of guessing again.
+          dump_diag() {
+            for ns in mongo-source mongo-target; do
+              echo "--- DIAGNOSTIC: $ns rs.status() ---"
+              kubectl -n "$ns" exec mongo-0 -- mongosh --quiet -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || kubectl -n "$ns" exec mongo-0 -- mongo --quiet -u "$MONGO_ROOT_USER" -p "$MONGO_ROOT_PASSWORD" --authenticationDatabase admin --eval "JSON.stringify(rs.status().members.map(m=>({host:m.name,state:m.stateStr,health:m.health})))" 2>&1 \
+                || echo "(failed to query $ns directly too - cluster-wide issue, not loadgen-specific)"
+            done
+          }
+          retry() {
+            local desc="$1"; shift
+            for i in $(seq 1 10); do
+              if "$@"; then return 0; fi
+              echo "::warning::$desc attempt $i failed, retrying in 15s..."
+              dump_diag
+              sleep 15
+            done
+            echo "::error::$desc failed after 10 attempts"
+            return 1
+          }
+          retry "seed-baseline" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-baseline --src "$SRC" --tgt "$TGT"
+          retry "seed-users" kubectl -n mongogate-test exec e2e-tools -- /app/loadgen seed-users --src "$SRC" --tgt "$TGT"
+
+      # Phase 1 is *expected* to report diffs for 4.4/5.0/6.0 (that's the
+      # point of this matrix) - the assertion below checks for the exact,
+      # already-documented findings, not a clean pass/fail.
+      - name: Run Phase 1 and assert findings match docs/TESTING.md section 10 exactly
+        run: |
+          set +e
+          OUT=$(kubectl -n mongogate-test exec e2e-tools -- /app/mongogate --phase 1 2>&1)
+          set -e
+          echo "$OUT"
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          case "${{ matrix.source_version }}" in
+            4.4|5.0)
+              echo "$OUT" | grep -q "clusteredIndex" || fail "expected a clusteredIndex diff for source ${{ matrix.source_version }} (clustered collections need 5.3+) - not found, did a fix change this documented boundary?"
+              ;;
+            6.0|7.0)
+              echo "$OUT" | grep -q "clusteredIndex" && fail "unexpected clusteredIndex diff for source ${{ matrix.source_version }} - should match target from 6.0 onward per docs/TESTING.md section 10"
+              ;;
+          esac
+
+          case "${{ matrix.source_version }}" in
+            4.4|5.0|6.0)
+              echo "$OUT" | grep -q "meta_1_ts_1" || fail "expected a meta_1_ts_1 index diff for source ${{ matrix.source_version }} (auto-index introduced between 6.0 and 7.0) - not found"
+              ;;
+            7.0)
+              echo "$OUT" | grep -q "meta_1_ts_1" && fail "unexpected meta_1_ts_1 diff for source 7.0 - should match target exactly per docs/TESTING.md section 10"
+              echo "$OUT" | grep -q "diffs found" && fail "source 7.0 vs target 8.0 should be a fully clean Phase 1 pass (zero structural findings) per docs/TESTING.md section 10"
+              ;;
+          esac
+
+          echo "Findings match the documented boundaries for source=${{ matrix.source_version }}"
+
+      - name: Phase 3 must not crash and must report zero false positives on real data
+        run: |
+          set +e
+          OUT=$(kubectl -n mongogate-test exec e2e-tools -- /app/mongogate --phase 3 2>&1)
+          set -e
+          echo "$OUT"
+          # Every row that *does* compare (anything not excluded as version-
+          # internal storage - see isGridFSInternal/isTimeSeriesBucket in
+          # cmd/mongogate/main.go) must show missing=0, diff=0, and
+          # extra_in_target=0: these are real user-visible collections with
+          # identical seeded content (confirmed live for all four versions
+          # in this matrix during development), so any non-zero count here
+          # is a false-positive regression, not an expected cross-version
+          # finding.
+          if echo "$OUT" | grep -E "missing=[1-9]|diff=[1-9]|extra_in_target=[1-9]"; then
+            echo "::error::found a data-verification row with a nonzero missing/diff/extra_in_target count - possible false-positive regression"
+            exit 1
+          fi
+
+      - name: Teardown
+        if: always()
+        working-directory: test/e2e/scripts
+        run: bash teardown.sh

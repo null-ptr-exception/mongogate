@@ -26,11 +26,11 @@ func (s *Server) Start() {
 		return
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health",    s.handleHealth)
-	mux.HandleFunc("/status",    s.handleStatus)
-	mux.HandleFunc("/progress",  s.handleProgress)
-	mux.HandleFunc("/report",    s.handleReport)
-	mux.HandleFunc("/passed",    s.handlePassed)
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/progress", s.handleProgress)
+	mux.HandleFunc("/report", s.handleReport)
+	mux.HandleFunc("/passed", s.handlePassed)
 
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf(":%d", s.port),

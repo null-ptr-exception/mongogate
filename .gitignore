@@ -1,6 +1,7 @@
-mongogate
-checkpoints.json
+/mongogate
+checkpoints*.json
 verify_report_*.json
 diff_*.csv
 *.log
 .DS_Store
+.claude/
