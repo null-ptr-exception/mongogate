@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -32,6 +33,28 @@ type DataVerifyOptions struct {
 	Bidirectional bool // also scan target → source
 	DryRun        bool
 	HashOpts      utils.HashOptions
+
+	// RangeSplitThresholdDocs/RangeWorkersPerCollection control _id-range
+	// splitting for collections too large for one cursor/goroutine to scan
+	// in a reasonable time - see expandTasks and range_split.go.
+	RangeSplitThresholdDocs   int64
+	RangeWorkersPerCollection int
+}
+
+// sharedProgress is the per-namespace state every range sub-task of a
+// split collection reports into: one progress bar and one set of running
+// totals, instead of each range writing its own bar (which would garble
+// stdout - see docs on progress.Bar) or its own disjoint counters (which
+// would make the report/HTTP-API progress and Prometheus gauges flicker as
+// different ranges overwrite each other's partial numbers). An unsplit
+// collection also gets one of these, sized from its own count, so the rest
+// of the pipeline doesn't need a split/unsplit branch.
+type sharedProgress struct {
+	bar       *progress.Bar
+	total     int64 // denominator for aggregate percent - approximate for split collections, exact otherwise
+	processed int64 // atomic
+	missing   int64 // atomic
+	different int64 // atomic
 }
 
 // VerifyAllData verifies every collection in parallel across MaxWorkers goroutines.
@@ -54,8 +77,10 @@ func VerifyAllData(
 	}
 	fmt.Println()
 
-	taskCh := make(chan CollectionTask, len(collections))
-	for _, t := range collections {
+	tasks, bars := expandTasks(ctx, src, opts, collections, rpt)
+
+	taskCh := make(chan CollectionTask, len(tasks))
+	for _, t := range tasks {
 		taskCh <- t
 	}
 	close(taskCh)
@@ -66,22 +91,112 @@ func VerifyAllData(
 		go func() {
 			defer wg.Done()
 			for task := range taskCh {
-				result := verifyOneCollection(ctx, src, tgt, task, opts, mw, am, pm, rpt)
-				rpt.SetData(result.NS, result)
+				result := verifyOneTask(ctx, src, tgt, task, opts, mw, am, pm, rpt, bars)
+				combined, isLast := rpt.MergeData(result.NS, result)
+				if !isLast {
+					// Another range of this namespace is still outstanding -
+					// counts are incomplete, nothing to print yet.
+					continue
+				}
+				if sp, ok := bars[result.NS]; ok && sp.bar != nil {
+					sp.bar.Done()
+				}
 				status := "✅"
-				if !result.Passed {
+				if !combined.Passed {
 					status = "❌"
 				}
 				fmt.Printf("  %s %-45s src=%-8d missing=%-5d diff=%-5d extra_in_target=%-5d\n",
-					status, result.NS, result.SrcCount,
-					result.MissingCount, result.DifferentCount, result.ExtraInTarget)
+					status, combined.NS, combined.SrcCount,
+					combined.MissingCount, combined.DifferentCount, combined.ExtraInTarget)
 			}
 		}()
 	}
 	wg.Wait()
 }
 
-func verifyOneCollection(
+// expandTasks looks at each collection's estimated size and, for
+// collections above RangeSplitThresholdDocs, replaces the single
+// whole-collection task with multiple _id-range sub-tasks that scan
+// concurrently instead of being bound to one cursor/goroutine (see
+// docs/TESTING.md "Parallelism is per-collection, not per-document" and
+// range_split.go). This applies in both Phase 2 (sampled - gives stratified
+// per-range sampling and cheap range-count reconciliation) and Phase 3
+// (exact - gives real intra-collection parallelism), since a collection
+// large enough to need one benefits from the other too.
+//
+// It also builds the sharedProgress every task (split or not) reports its
+// progress into, sized from a single EstimatedDocumentCount call per
+// collection - cheap even at 1TB, since it's a metadata read, not a scan.
+// EstimatedDocumentCount calls run concurrently (bounded by MaxWorkers) so
+// a run with many collections doesn't pay for them one at a time before
+// any real work starts.
+func expandTasks(
+	ctx context.Context,
+	src *mongo.Client,
+	opts DataVerifyOptions,
+	collections []CollectionTask,
+	rpt *report.Report,
+) ([]CollectionTask, map[string]*sharedProgress) {
+	if opts.DryRun {
+		// Dry-run only counts and exits - no bars, no splitting, matches
+		// today's behavior exactly.
+		return collections, map[string]*sharedProgress{}
+	}
+
+	canSplit := opts.RangeWorkersPerCollection > 1 && opts.RangeSplitThresholdDocs > 0
+
+	type expanded struct {
+		tasks []CollectionTask
+		sp    *sharedProgress
+	}
+	results := make([]expanded, len(collections))
+
+	sem := make(chan struct{}, max(opts.MaxWorkers, 1))
+	var wg sync.WaitGroup
+	for i, base := range collections {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, base CollectionTask) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			ns := base.NS()
+			col := src.Database(base.DBName).Collection(base.ColName)
+			estCount, _ := col.EstimatedDocumentCount(ctx)
+
+			if canSplit && estCount > opts.RangeSplitThresholdDocs {
+				if ranges, method := computeRanges(ctx, col, opts.RangeWorkersPerCollection); len(ranges) > 1 {
+					fmt.Printf("  ✂️  [%s] ~%d docs > %d threshold, splitting into %d ranges (%s)\n",
+						ns, estCount, opts.RangeSplitThresholdDocs, len(ranges), method)
+					rpt.BeginRanges(ns, len(ranges))
+					tasks := make([]CollectionTask, len(ranges))
+					for j, rg := range ranges {
+						t := base
+						t.RangeIndex = j
+						t.RangeTotal = len(ranges)
+						t.RangeMin = rg.Min
+						t.RangeMax = rg.Max
+						tasks[j] = t
+					}
+					results[i] = expanded{tasks: tasks, sp: &sharedProgress{bar: progress.New(ns, estCount), total: estCount}}
+					return
+				}
+			}
+			results[i] = expanded{tasks: []CollectionTask{base}, sp: &sharedProgress{bar: progress.New(ns, estCount), total: estCount}}
+		}(i, base)
+	}
+	wg.Wait()
+
+	var tasks []CollectionTask
+	bars := make(map[string]*sharedProgress, len(collections))
+	for _, r := range results {
+		tasks = append(tasks, r.tasks...)
+		bars[r.tasks[0].NS()] = r.sp
+	}
+	return tasks, bars
+}
+
+func verifyOneTask(
 	ctx context.Context,
 	src, tgt *mongo.Client,
 	task CollectionTask,
@@ -90,23 +205,45 @@ func verifyOneCollection(
 	am *alert.AlertManager,
 	pm *promMetrics.MetricsServer,
 	rpt *report.Report,
+	bars map[string]*sharedProgress,
 ) *report.DataResult {
 
-	ns := task.DBName + "." + task.ColName
+	ns := task.NS()
 	srcCol := src.Database(task.DBName).Collection(task.ColName)
 	tgtCol := tgt.Database(task.DBName).Collection(task.ColName)
 	startTime := time.Now()
+	rangeFilter := idRangeFilter(task)
 
-	srcCount := countWithRetry(ctx, srcCol, opts)
-	tgtCount := countWithRetry(ctx, tgtCol, opts)
+	var srcCount, tgtCount int64
+	if task.IsSplit() {
+		// A bounded range's count is an index-range scan, not a full
+		// collection scan, so it stays cheap here even though a whole-
+		// collection exact count would not be (see countWithRetry). This
+		// doubles as Phase 2's range-count reconciliation signal below.
+		srcCount, tgtCount = countRangeBothSides(ctx, srcCol, tgtCol, rangeFilter, opts)
+	} else {
+		fmt.Printf("  ⏳ [%s] counting documents (large collections can take a while)...\n", ns)
+		srcCount, tgtCount = countBothSides(ctx, srcCol, tgtCol, opts)
+	}
 
 	result := &report.DataResult{
 		NS:           ns,
 		SrcCount:     srcCount,
 		TgtCount:     tgtCount,
 		CountMatch:   srcCount == tgtCount,
-		CountIsExact: opts.SampleRate == 0, // sampled phases use the metadata estimate
+		CountIsExact: opts.SampleRate == 0,
 		HashIsExact:  opts.SampleRate == 0,
+	}
+
+	if task.IsSplit() && srcCount != tgtCount {
+		// Cheap, index-only signal that this specific sub-range has drifted -
+		// surfaced as an error so it fails the namespace's Passed check even
+		// if other ranges' drift happens to cancel out in the aggregate sum,
+		// and so a human immediately knows which slice of the keyspace to
+		// re-check with a full (unsampled) pass.
+		result.Errors = append(result.Errors, fmt.Sprintf(
+			"range %d/%d count mismatch: src=%d tgt=%d - re-check this range with phase 3",
+			task.RangeIndex+1, task.RangeTotal, srcCount, tgtCount))
 	}
 
 	if opts.DryRun {
@@ -115,22 +252,24 @@ func verifyOneCollection(
 		return result
 	}
 
-	bar := progress.New(ns, srcCount)
+	sp := bars[ns]
 
 	// ── Forward: source → target ──
-	processSrcToTgt(ctx, srcCol, tgtCol, ns, srcCount, startTime,
-		opts, mw, am, pm, rpt, result, bar)
+	processSrcToTgt(ctx, srcCol, tgtCol, task, rangeFilter, srcCount, startTime,
+		opts, mw, am, pm, rpt, result, sp)
 
 	// ── Reverse: target → source (find docs that only exist in target) ──
 	if opts.Bidirectional {
-		processTgtToSrc(ctx, srcCol, tgtCol, ns, opts, result)
+		processTgtToSrc(ctx, srcCol, tgtCol, rangeFilter, opts, result)
 		am.CheckExtraInTarget(ns, result.ExtraInTarget)
 	}
 
-	bar.Done()
-	// len(Errors) == 0 is part of Passed: a collection whose scan errored out
-	// (e.g. "find failed") was never actually verified, and previously could
-	// slip through as passing when counts happened to match.
+	// len(Errors) == 0 is part of Passed: a collection whose scan errored
+	// out (e.g. "find failed") was never actually verified, and previously
+	// could slip through as passing when counts happened to match. For a
+	// split task this is only this range's own partial Passed - the
+	// authoritative combined Passed is computed once in
+	// report.Report.MergeData after every range has reported in.
 	result.Passed = result.CountMatch &&
 		result.MissingCount == 0 &&
 		result.DifferentCount == 0 &&
@@ -140,24 +279,56 @@ func verifyOneCollection(
 	return result
 }
 
+// idRangeFilter returns the _id bound filter for a range sub-task, or an
+// empty filter for a whole-collection task.
+func idRangeFilter(task CollectionTask) bson.M {
+	if !task.IsSplit() {
+		return bson.M{}
+	}
+	cond := bson.M{}
+	if task.RangeMin != nil {
+		cond["$gte"] = task.RangeMin
+	}
+	if task.RangeMax != nil {
+		cond["$lt"] = task.RangeMax
+	}
+	if len(cond) == 0 {
+		return bson.M{}
+	}
+	return bson.M{"_id": cond}
+}
+
 // processSrcToTgt walks a cursor over source and looks each document up in target.
 func processSrcToTgt(
 	ctx context.Context,
 	srcCol, tgtCol *mongo.Collection,
-	ns string, total int64, startTime time.Time,
+	task CollectionTask,
+	rangeFilter bson.M,
+	total int64, startTime time.Time,
 	opts DataVerifyOptions,
 	mw *monitor.MetricsWriter,
 	am *alert.AlertManager,
 	pm *promMetrics.MetricsServer,
 	rpt *report.Report,
 	result *report.DataResult,
-	bar *progress.Bar,
+	sp *sharedProgress,
 ) {
+	ns := task.NS()
+	cpKey := task.CheckpointKey()
+
 	filter := bson.M{}
+	for k, v := range rangeFilter {
+		filter[k] = v
+	}
 	if opts.Resume {
-		if lastID, ok := utils.LoadCheckpoint(ns); ok {
-			filter = bson.M{"_id": bson.M{"$gt": lastID}}
-			fmt.Printf("  🔄 [%s] resuming from checkpoint\n", ns)
+		if lastID, ok := utils.LoadCheckpoint(cpKey); ok {
+			idCond, _ := filter["_id"].(bson.M)
+			if idCond == nil {
+				idCond = bson.M{}
+			}
+			idCond["$gt"] = lastID
+			filter["_id"] = idCond
+			fmt.Printf("  🔄 [%s] resuming from checkpoint\n", cpKey)
 		}
 	}
 
@@ -193,9 +364,19 @@ func processSrcToTgt(
 				ns, sampleSize, maxFast)
 			sampleSize = maxFast
 		}
-		cur, err = srcCol.Aggregate(ctx, mongo.Pipeline{
-			{{Key: "$sample", Value: bson.M{"size": sampleSize}}},
-		}, options.Aggregate().SetAllowDiskUse(true).SetBatchSize(int32(opts.BatchSize)))
+		// A split task's `total` is this range's own count (see
+		// countRangeBothSides), so sampleSize here is already this range's
+		// proportional share of the namespace-wide sample - stratified
+		// across the whole _id keyspace instead of trusting $sample's own
+		// randomness to spread evenly over a huge collection. $match-ing to
+		// the range first keeps the sample confined to it.
+		pipeline := mongo.Pipeline{}
+		if len(rangeFilter) > 0 {
+			pipeline = append(pipeline, bson.D{{Key: "$match", Value: rangeFilter}})
+		}
+		pipeline = append(pipeline, bson.D{{Key: "$sample", Value: bson.M{"size": sampleSize}}})
+		cur, err = srcCol.Aggregate(ctx, pipeline,
+			options.Aggregate().SetAllowDiskUse(true).SetBatchSize(int32(opts.BatchSize)))
 	} else {
 		cur, err = srcCol.Find(ctx, filter, findOpts)
 	}
@@ -278,12 +459,13 @@ func processSrcToTgt(
 				// Presence/content unknown even after bisected retries -
 				// counting it either way would fabricate a result.
 				processed++
-				bar.Update(processed)
+				reportProgress(sp, atomic.AddInt64(&sp.processed, 1))
 				continue
 			}
 			tgtDoc, found := tgtDocs[key]
 			if !found {
 				result.MissingCount++
+				atomic.AddInt64(&sp.missing, 1)
 				if len(result.MissingSample) < 50 {
 					result.MissingSample = append(result.MissingSample, fmt.Sprintf("%v", docID))
 				}
@@ -293,6 +475,7 @@ func processSrcToTgt(
 				passed, diffs := utils.DeepCompare(srcDoc, tgtDoc, opts.HashOpts)
 				if !passed {
 					result.DifferentCount++
+					atomic.AddInt64(&sp.different, 1)
 					if len(result.DiffSample) < 50 {
 						result.DiffSample = append(result.DiffSample,
 							formatDiffSample(docID, diffs))
@@ -314,11 +497,12 @@ func processSrcToTgt(
 			}
 
 			processed++
-			bar.Update(processed)
+			newTotal := atomic.AddInt64(&sp.processed, 1)
+			reportProgress(sp, newTotal)
 
 			if processed%1000 == 0 {
-				utils.SaveCheckpoint(ns, fmt.Sprintf("%v", docID))
-				pct := float64(processed) / float64(total) * 100
+				utils.SaveCheckpoint(cpKey, fmt.Sprintf("%v", docID))
+				pct := aggregatePct(sp)
 				rpt.UpdateProgress(ns, pct)
 
 				mw.Write(monitor.Metric{
@@ -334,11 +518,14 @@ func processSrcToTgt(
 				// Alert check
 				am.Check(ns, result.MissingCount, result.DifferentCount, pct)
 
-				// Prometheus
+				// Prometheus - aggregate across ranges so a namespace split
+				// into sub-ranges shows one coherent, monotonically
+				// increasing set of gauges instead of whichever range's
+				// update landed last overwriting the others'.
 				label := strings.ReplaceAll(ns, ".", "_")
 				pm.Set(fmt.Sprintf("ns_progress_%s", label), pct)
-				pm.Set(fmt.Sprintf("ns_missing_%s", label), float64(result.MissingCount))
-				pm.Set(fmt.Sprintf("ns_different_%s", label), float64(result.DifferentCount))
+				pm.Set(fmt.Sprintf("ns_missing_%s", label), float64(atomic.LoadInt64(&sp.missing)))
+				pm.Set(fmt.Sprintf("ns_different_%s", label), float64(atomic.LoadInt64(&sp.different)))
 
 				if opts.RateLimitMS > 0 {
 					time.Sleep(time.Duration(opts.RateLimitMS) * time.Millisecond)
@@ -365,15 +552,33 @@ func processSrcToTgt(
 	}
 }
 
+// reportProgress updates the namespace's shared bar with the aggregate
+// processed count across every range (not just this task's own), so a
+// split collection's bar reflects real combined progress instead of one
+// range restarting the display from its own local count.
+func reportProgress(sp *sharedProgress, aggregateProcessed int64) {
+	if sp == nil || sp.bar == nil {
+		return
+	}
+	sp.bar.Update(aggregateProcessed)
+}
+
+func aggregatePct(sp *sharedProgress) float64 {
+	if sp == nil || sp.total <= 0 {
+		return 0
+	}
+	return float64(atomic.LoadInt64(&sp.processed)) / float64(sp.total) * 100
+}
+
 // processTgtToSrc scans target for documents that don't exist in source.
 func processTgtToSrc(
 	ctx context.Context,
 	srcCol, tgtCol *mongo.Collection,
-	ns string,
+	rangeFilter bson.M,
 	opts DataVerifyOptions,
 	result *report.DataResult,
 ) {
-	cur, err := tgtCol.Find(ctx, bson.M{},
+	cur, err := tgtCol.Find(ctx, rangeFilter,
 		options.Find().
 			SetSort(bson.D{{Key: "_id", Value: 1}}).
 			SetBatchSize(int32(opts.BatchSize)).
@@ -466,12 +671,60 @@ func processTgtToSrc(
 
 // ── Retry helpers ──
 
-// countWithRetry returns the collection's document count. Sampled phases use
-// the O(1) metadata-based estimate: the exact CountDocuments scans the whole
-// _id index, which on a multi-GB collection means minutes of silence - twice
-// per collection, before the progress bar even appears - for a phase whose
+// countBothSides runs the source and target counts concurrently rather
+// than back to back - each one can itself take minutes on a huge
+// collection (see countWithRetry), so this halves the wait instead of
+// paying for both in sequence before the first byte of real scanning work
+// happens.
+func countBothSides(ctx context.Context, srcCol, tgtCol *mongo.Collection, opts DataVerifyOptions) (int64, int64) {
+	var srcCount, tgtCount int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); srcCount = countWithRetry(ctx, srcCol, opts) }()
+	go func() { defer wg.Done(); tgtCount = countWithRetry(ctx, tgtCol, opts) }()
+	wg.Wait()
+	return srcCount, tgtCount
+}
+
+// countRangeBothSides counts a bounded _id range on both sides
+// concurrently. Unlike countWithRetry's whole-collection CountDocuments,
+// this is always an index-range scan bounded by the range filter, so it
+// stays cheap even on a collection too large to count exactly up front -
+// this is exactly why range-split collections skip the whole-collection
+// precount entirely and rely on this instead (see verifyOneTask).
+func countRangeBothSides(ctx context.Context, srcCol, tgtCol *mongo.Collection, filter bson.M, opts DataVerifyOptions) (int64, int64) {
+	var srcCount, tgtCount int64
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); srcCount = countRangeWithRetry(ctx, srcCol, filter, opts) }()
+	go func() { defer wg.Done(); tgtCount = countRangeWithRetry(ctx, tgtCol, filter, opts) }()
+	wg.Wait()
+	return srcCount, tgtCount
+}
+
+func countRangeWithRetry(ctx context.Context, col *mongo.Collection, filter bson.M, opts DataVerifyOptions) int64 {
+	for i := 0; i <= opts.RetryCount; i++ {
+		n, err := col.CountDocuments(ctx, filter)
+		if err == nil {
+			return n
+		}
+		if i < opts.RetryCount {
+			time.Sleep(time.Duration(opts.RetryWaitMS) * time.Millisecond)
+		}
+	}
+	return 0
+}
+
+// countWithRetry returns a whole collection's document count. Sampled
+// phases use the O(1) metadata-based estimate: the exact CountDocuments
+// scans the whole _id index, which on a multi-GB collection means minutes
+// of silence before the progress bar even appears - for a phase whose
 // verdict is approximate by design. The unsampled (final) phase keeps the
-// exact scan.
+// exact scan, but only reaches this function at all for collections that
+// stayed below RangeSplitThresholdDocs - collections large enough to be
+// range-split skip this exact precount entirely and get their authoritative
+// count from summing what the scan actually processed per range instead
+// (see countRangeBothSides and expandTasks).
 func countWithRetry(ctx context.Context, col *mongo.Collection, opts DataVerifyOptions) int64 {
 	exact := opts.SampleRate == 0
 	for i := 0; i <= opts.RetryCount; i++ {
@@ -600,3 +853,4 @@ func formatDiffSample(docID interface{}, diffs []utils.DiffDetail) string {
 	}
 	return strings.Join(parts, " | ")
 }
+

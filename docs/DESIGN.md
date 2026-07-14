@@ -562,7 +562,7 @@ scales with the size of the largest document encountered, not the documented
 baseline. Measured, not assumed: see `docs/TESTING.md`'s large-document
 findings (a single 12MB document drove peak RSS to ~917MB).
 
-### Throughput (estimated, 4 workers)
+### Throughput (estimated, 8 workers)
 
 | Data volume | Estimated time |
 |-------------|-----------------|
@@ -570,18 +570,38 @@ findings (a single 12MB document drove peak RSS to ~917MB).
 | 10,000,000 docs | 30–60 minutes |
 | 100,000,000 docs | 5–10 hours |
 
-These are design-time estimates; see `docs/TESTING.md` for actual measurements
-taken in a real cluster.
+These are design-time estimates, and — like the measured number below —
+assume the volume is spread across enough collections to keep every worker
+busy; see `docs/TESTING.md` for actual measurements taken in a real cluster.
+
+**Parallelism is per-collection, not per-document (with one exception).**
+`max_workers` controls how many *collections* are verified concurrently; a
+single collection was always processed by exactly one worker/cursor,
+however high `max_workers` was set (`docs/TESTING.md` measured ~530
+docs/sec for one collection this way — the throughput table above is an
+aggregate that assumes parallelism *across* collections, not a guarantee for
+any single one, regardless of size).
+
+The exception: a collection estimated above `range_split_threshold_docs` is
+now split into `range_workers_per_collection` concurrent `_id`-range
+sub-tasks (`internal/verifier/range_split.go`), so it's no longer bound to
+one worker's throughput. These range tasks share the same `max_workers` pool
+as cross-collection parallelism rather than adding to it, so a large
+collection splitting into many ranges can temporarily crowd out other
+collections in the same run — see README's "Large collections" section for
+the operational tradeoff. This has not been benchmarked at the scale that
+motivated it (1TB+) in this repo's test environment; the numbers above and
+in `docs/TESTING.md` predate it.
 
 ### Throttling
 
 ```
-rate_limit_ms: 10     # pause 10ms between every 500-doc batch
+rate_limit_ms: 2      # pause between every batch_size-doc batch
                       # reduces pressure on the database
                       # 0 = full speed
 
-max_workers: 4        # parallel collections
-                      # more workers = faster but more DB pressure
+max_workers: 8        # parallel collections (and, for a split collection,
+                      # the same pool its range sub-tasks share)
 ```
 
 ### Retry behavior
@@ -1168,7 +1188,7 @@ safety limit.
 
 Yes, because it:
 - reads from secondaries (`readPreference=secondaryPreferred`)
-- rate-limits itself (10ms per batch)
+- rate-limits itself (`rate_limit_ms`, configurable)
 - uses an independent connection pool
 - only reads from source, never writes to it
 

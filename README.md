@@ -148,6 +148,43 @@ source — which happens when a migration script has a bug, something else is
 writing into target, or a delete never replicated. `bidirectional: true` adds
 a reverse `_id`-only scan of target against source to catch exactly that.
 
+### Large collections (100GB+ / 1TB+)
+
+Parallelism (`max_workers`) is across *collections*, not within one — a
+single huge collection was always bound by one cursor/goroutine's
+throughput, no matter how high `max_workers` was set (measured at ~530
+docs/sec for one collection in `docs/TESTING.md`; at that rate a
+billion-document collection takes weeks, not hours).
+
+Collections estimated above `range_split_threshold_docs` (default 2,000,000)
+are now split into `range_workers_per_collection` concurrent `_id`-range
+sub-tasks instead — see `internal/verifier/range_split.go` for how the
+boundaries are computed (a `splitVector` admin command when available,
+falling back to an index-covered `$bucketAuto` aggregation otherwise) and
+`docs/DESIGN.md` for the parallelism model this replaces. Range workers
+share the same `max_workers` pool rather than adding on top of it — one huge
+collection splitting into 8 ranges can temporarily occupy most of the pool,
+so smaller collections in the same run may queue behind it. Splitting also
+applies to Phase 2, where it turns the sampled pass into a stratified sample
+(spread evenly across the whole `_id` keyspace instead of trusting a single
+`$sample` call's randomness on a huge collection) plus a cheap per-range
+count reconciliation that flags which specific range drifted, instead of
+only knowing the collection-wide count is off.
+
+Recommended cadence once a collection is this large:
+
+- **Routine monitoring: Phase 2 only.** It's sampled and cheap; don't run
+  Phase 3 on every check.
+- **Phase 3 (full, exact): once, near cutover.** Run it off-peak, with
+  `--resume` available if it's interrupted — each range checkpoints
+  independently (`checkpoints_*.json` keys look like `db.col#r3/8`), so a
+  resumed run only re-scans the ranges that hadn't finished, not the whole
+  collection.
+- If Phase 2 flags a specific range's count as mismatched, you don't have to
+  wait for a full Phase 3 pass to investigate it — `--include-ns` still
+  scopes to the whole collection (range-splitting happens automatically
+  underneath it, not per-range from the CLI).
+
 ## Architecture
 
 ```
@@ -180,10 +217,13 @@ test/e2e/      not part of the product — a kind-based E2E harness
 
 One sentence on data flow: `VerifyDatabases`/`VerifyCollections` enumerate
 what's in scope (also running the structural checks along the way) → the
-resulting collection list feeds `VerifyAllData`, which fans out across
-`max_workers` goroutines, each streaming one collection through
-`DeepCompare` → every check writes into the same `*report.Report`, which
-decides what gets printed, saved, and the exit code.
+resulting collection list feeds `VerifyAllData`, which splits any collection
+above `range_split_threshold_docs` into `_id`-range sub-tasks and fans
+everything out across `max_workers` goroutines, each streaming one
+collection (or one range of a large one) through `DeepCompare` → every
+check writes into the same `*report.Report` (ranges of one collection merge
+into a single combined result), which decides what gets printed, saved, and
+the exit code.
 
 Full breakdown — every file, the complete data-flow diagram, and the
 rationale behind each design decision (why SHA256 not MD5, why
@@ -301,11 +341,12 @@ skip_dbs:
 ```
 
 Everything else (`batch_size`, `max_workers`, `rate_limit_ms`,
-`sample_rate`, `hash_options`) ships with safe defaults already tuned for
-reading a live production source without disrupting it — see
-[`config.yaml`](config.yaml) for the full annotated list and
-[`docs/DESIGN.md`](docs/DESIGN.md#9-performance--memory-design) for the
-reasoning behind the performance-related ones.
+`sample_rate`, `range_split_threshold_docs`, `range_workers_per_collection`,
+`hash_options`) ships with safe defaults already tuned for reading a live
+production source without disrupting it — see [`config.yaml`](config.yaml)
+for the full annotated list, [`docs/DESIGN.md`](docs/DESIGN.md#9-performance--memory-design)
+for the reasoning behind the performance-related ones, and "Large
+collections" above for what the two `range_*` settings do.
 
 ## Usage
 

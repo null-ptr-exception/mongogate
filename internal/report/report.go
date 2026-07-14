@@ -70,6 +70,11 @@ type Report struct {
 	GridFS      map[string]*Result     `json:"gridfs,omitempty"`
 	Views       map[string]*Result     `json:"views,omitempty"`
 	Data        map[string]*DataResult `json:"data,omitempty"`
+
+	// pendingRanges tracks, per namespace, how many range sub-tasks have
+	// yet to report in via MergeData. Not serialized - purely in-flight
+	// bookkeeping for range-split collections (see BeginRanges/MergeData).
+	pendingRanges map[string]int
 }
 
 func New() *Report {
@@ -118,6 +123,99 @@ func (r *Report) UpdateProgress(ns string, pct float64) {
 	} else {
 		r.Data[ns] = &DataResult{NS: ns, ProgressPct: pct}
 	}
+}
+
+// BeginRanges registers that ns has been split into `total` concurrent
+// range sub-tasks, so MergeData knows how many partial results to wait for
+// before treating ns as complete. Call once, before any of those tasks'
+// workers start, from a single goroutine (the pre-dispatch expansion step
+// in VerifyAllData) - MergeData itself is safe to call concurrently, but
+// the registration itself is not idempotent/mergeable across callers.
+// A ns never registered here is treated by MergeData as a single task
+// (today's non-split behavior).
+func (r *Report) BeginRanges(ns string, total int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.pendingRanges == nil {
+		r.pendingRanges = make(map[string]int)
+	}
+	r.pendingRanges[ns] = total
+}
+
+// MergeData accumulates one range (or, for an unsplit collection, the
+// whole-collection) partial result into ns's combined DataResult, and
+// reports whether every range registered for ns via BeginRanges has now
+// reported in. Counts are summed; sample/error slices are appended up to
+// their existing caps. Passed/CountMatch are (re)computed only once
+// isLast is true - callers must not print/act on the returned result
+// before then, since it's incomplete while ranges are still outstanding.
+//
+// SetData is a full overwrite and unsafe for concurrent range workers on
+// the same ns (see git history / docs/TESTING.md); MergeData is the
+// merge-aware replacement multi-range callers must use instead.
+func (r *Report) MergeData(ns string, delta *DataResult) (combined *DataResult, isLast bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	acc, ok := r.Data[ns]
+	if !ok {
+		acc = &DataResult{NS: ns, CountIsExact: true, HashIsExact: true}
+		r.Data[ns] = acc
+	}
+	acc.SrcCount += delta.SrcCount
+	acc.TgtCount += delta.TgtCount
+	acc.MissingCount += delta.MissingCount
+	acc.DifferentCount += delta.DifferentCount
+	acc.ExtraInTarget += delta.ExtraInTarget
+	acc.MissingSample = appendCapped(acc.MissingSample, delta.MissingSample, 50)
+	acc.DiffSample = appendCapped(acc.DiffSample, delta.DiffSample, 50)
+	acc.ExtraInTargetSample = appendCapped(acc.ExtraInTargetSample, delta.ExtraInTargetSample, 20)
+	acc.Errors = appendCapped(acc.Errors, delta.Errors, 20)
+	acc.FieldErrors = appendFieldErrorsCapped(acc.FieldErrors, delta.FieldErrors, 200)
+	// Every range of one run shares the same opts.SampleRate, so these
+	// should already agree across deltas - AND defensively rather than
+	// assume it.
+	acc.CountIsExact = acc.CountIsExact && delta.CountIsExact
+	acc.HashIsExact = acc.HashIsExact && delta.HashIsExact
+
+	remaining, began := r.pendingRanges[ns]
+	if !began {
+		remaining = 1
+	}
+	remaining--
+	if remaining > 0 {
+		r.pendingRanges[ns] = remaining
+		return acc, false
+	}
+	delete(r.pendingRanges, ns)
+
+	acc.CountMatch = acc.SrcCount == acc.TgtCount
+	acc.Passed = acc.CountMatch &&
+		acc.MissingCount == 0 &&
+		acc.DifferentCount == 0 &&
+		acc.ExtraInTarget == 0 &&
+		len(acc.Errors) == 0
+	return acc, true
+}
+
+func appendCapped(existing, add []string, cap int) []string {
+	for _, s := range add {
+		if len(existing) >= cap {
+			break
+		}
+		existing = append(existing, s)
+	}
+	return existing
+}
+
+func appendFieldErrorsCapped(existing, add []FieldError, cap int) []FieldError {
+	for _, e := range add {
+		if len(existing) >= cap {
+			break
+		}
+		existing = append(existing, e)
+	}
+	return existing
 }
 
 // ── Getters ──

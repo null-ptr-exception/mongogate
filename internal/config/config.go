@@ -63,6 +63,13 @@ type Config struct {
 	Phase2LagThresholdSeconds int     `yaml:"phase2_lag_threshold_seconds"`
 	SampleRate                float64 `yaml:"sample_rate"`
 
+	// RangeSplitThresholdDocs: collections estimated above this size are
+	// split into RangeWorkersPerCollection concurrent _id-range sub-tasks
+	// instead of being scanned by a single cursor/goroutine. See
+	// internal/verifier/range_split.go.
+	RangeSplitThresholdDocs   int64 `yaml:"range_split_threshold_docs"`
+	RangeWorkersPerCollection int   `yaml:"range_workers_per_collection"`
+
 	HashOptions HashOptions `yaml:"hash_options"`
 	Alert       AlertConfig `yaml:"alert"`
 
@@ -93,13 +100,15 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	cfg := &Config{
 		BatchSize:                 500,
-		MaxWorkers:                4,
+		MaxWorkers:                8,
 		RateLimitMS:               10,
 		TimeoutSecs:               30,
 		RetryCount:                3,
 		RetryWaitMS:               500,
 		Phase2LagThresholdSeconds: 10,
 		SampleRate:                0.1,
+		RangeSplitThresholdDocs:   2_000_000,
+		RangeWorkersPerCollection: 8,
 		// "admin" is skipped by default: its meaningful content (users,
 		// roles, replica set config) is already covered by dedicated,
 		// purpose-built checks (VerifyAuth, VerifyCluster) via proper admin
@@ -153,6 +162,15 @@ func validate(cfg *Config) error {
 	}
 	if cfg.SampleRate < 0 || cfg.SampleRate > 1 {
 		return fmt.Errorf("sample_rate must be between 0 and 1")
+	}
+	if cfg.RangeSplitThresholdDocs < 1 {
+		return fmt.Errorf("range_split_threshold_docs must be >= 1")
+	}
+	// range workers share max_workers' pool rather than adding on top of it
+	// (see docs/DESIGN.md) - a value above max_workers could never actually
+	// be reached and just misleads whoever reads the config.
+	if cfg.RangeWorkersPerCollection < 1 || cfg.RangeWorkersPerCollection > cfg.MaxWorkers {
+		return fmt.Errorf("range_workers_per_collection must be between 1 and max_workers (%d)", cfg.MaxWorkers)
 	}
 	return nil
 }

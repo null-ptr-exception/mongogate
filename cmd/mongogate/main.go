@@ -188,7 +188,9 @@ func main() {
 			RetryCount: cfg.RetryCount, RetryWaitMS: cfg.RetryWaitMS,
 			SampleRate: cfg.SampleRate, Phase: "Phase2",
 			Bidirectional: cfg.Verify.Bidirectional, DryRun: cfg.DryRun,
-			HashOpts: toHashOptions(cfg.HashOptions),
+			HashOpts:                  toHashOptions(cfg.HashOptions),
+			RangeSplitThresholdDocs:   cfg.RangeSplitThresholdDocs,
+			RangeWorkersPerCollection: cfg.RangeWorkersPerCollection,
 		}
 
 		if *loopInterval > 0 {
@@ -215,7 +217,9 @@ func main() {
 			RetryCount: cfg.RetryCount, RetryWaitMS: cfg.RetryWaitMS,
 			SampleRate: 0, Resume: *resume, Phase: "Phase3",
 			Bidirectional: cfg.Verify.Bidirectional, DryRun: cfg.DryRun,
-			HashOpts: toHashOptions(cfg.HashOptions),
+			HashOpts:                  toHashOptions(cfg.HashOptions),
+			RangeSplitThresholdDocs:   cfg.RangeSplitThresholdDocs,
+			RangeWorkersPerCollection: cfg.RangeWorkersPerCollection,
 		}
 		verifier.VerifyAllData(ctx, src, tgt, collections, opts, mw, am, pm, rpt)
 
