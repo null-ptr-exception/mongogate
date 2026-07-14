@@ -185,6 +185,11 @@ Recommended cadence once a collection is this large:
   scopes to the whole collection (range-splitting happens automatically
   underneath it, not per-range from the CLI).
 
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for measured throughput vs
+worker count and what that projects to at 10G/100G/500G/1T — with the
+methodology caveats spelled out (small-scale local measurement, not a real
+1TB run).
+
 ## Architecture
 
 ```
