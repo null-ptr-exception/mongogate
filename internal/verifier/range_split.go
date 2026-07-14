@@ -45,7 +45,7 @@ func computeRanges(ctx context.Context, col *mongo.Collection, n int) (ranges []
 	}
 
 	if r, err := splitVectorRanges(ctx, col, n); err == nil && len(r) > 1 {
-		return r, "splitVector"
+		return capRanges(r, n), "splitVector"
 	}
 
 	if r, err := bucketAutoRanges(ctx, col, n); err == nil && len(r) > 1 {
@@ -53,6 +53,34 @@ func computeRanges(ctx context.Context, col *mongo.Collection, n int) (ranges []
 	}
 
 	return []IDRange{{}}, "none"
+}
+
+// capRanges merges adjacent ranges down to at most n. splitVector splits by
+// byte size (maxChunkSize), not by count - an avgObjSize estimate that's
+// even slightly off produces more (or fewer) chunks than requested, unlike
+// $bucketAuto's buckets:n which is count-exact. range_workers_per_collection
+// is documented (README, config.yaml) as the number of concurrent workers a
+// collection splits into and is validated against max_workers on that
+// assumption - silently handing back more ranges than that would let a
+// collection's actual concurrency exceed the configured/validated ceiling.
+func capRanges(ranges []IDRange, n int) []IDRange {
+	if len(ranges) <= n || n < 1 {
+		return ranges
+	}
+	out := make([]IDRange, 0, n)
+	perGroup := float64(len(ranges)) / float64(n)
+	for i := 0; i < n; i++ {
+		start := int(float64(i) * perGroup)
+		end := int(float64(i+1) * perGroup)
+		if end > len(ranges) {
+			end = len(ranges)
+		}
+		if start >= end {
+			continue
+		}
+		out = append(out, IDRange{Min: ranges[start].Min, Max: ranges[end-1].Max})
+	}
+	return out
 }
 
 // splitVectorRanges asks the storage engine for split points sized so the

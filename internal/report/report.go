@@ -75,6 +75,10 @@ type Report struct {
 	// yet to report in via MergeData. Not serialized - purely in-flight
 	// bookkeeping for range-split collections (see BeginRanges/MergeData).
 	pendingRanges map[string]int
+	// mergeStarted tracks which namespaces have received their first real
+	// MergeData call, since r.Data[ns] existing is not sufficient evidence
+	// of that (see MergeData).
+	mergeStarted map[string]bool
 }
 
 func New() *Report {
@@ -159,8 +163,26 @@ func (r *Report) MergeData(ns string, delta *DataResult) (combined *DataResult, 
 
 	acc, ok := r.Data[ns]
 	if !ok {
-		acc = &DataResult{NS: ns, CountIsExact: true, HashIsExact: true}
+		acc = &DataResult{NS: ns}
 		r.Data[ns] = acc
+	}
+	if !r.mergeStarted[ns] {
+		// r.Data[ns] existing is not proof this ns was already initialized
+		// by a prior MergeData call: UpdateProgress creates a bare
+		// placeholder entry (NS/ProgressPct only) the moment the first
+		// progress tick arrives, which happens mid-scan, well before this
+		// task's single MergeData call at the end - so `ok` above is
+		// already true on ns's very first (and for an unsplit collection,
+		// only) MergeData call. CountIsExact/HashIsExact must start true
+		// (the AND below only ever turns them false), but the placeholder's
+		// zero-value false would poison every subsequent AND. Track
+		// initialization explicitly instead of trusting map-key presence.
+		acc.CountIsExact = true
+		acc.HashIsExact = true
+		if r.mergeStarted == nil {
+			r.mergeStarted = make(map[string]bool)
+		}
+		r.mergeStarted[ns] = true
 	}
 	acc.SrcCount += delta.SrcCount
 	acc.TgtCount += delta.TgtCount

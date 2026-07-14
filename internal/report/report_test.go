@@ -114,6 +114,31 @@ func TestMergeData_ConcurrentRangesAggregateExactly(t *testing.T) {
 	}
 }
 
+func TestMergeData_ExactFlagsSurviveAPriorUpdateProgressCall(t *testing.T) {
+	// UpdateProgress creates a bare placeholder DataResult{NS, ProgressPct}
+	// the moment the first progress tick arrives, mid-scan - well before
+	// MergeData's own call for that task completes. That placeholder's
+	// CountIsExact/HashIsExact are Go zero-values (false). A regression
+	// here would make every Phase 3 (exact) run past the first progress
+	// tick (1000 docs) permanently report exact=false.
+	r := New()
+	r.UpdateProgress("db.col", 42.0)
+
+	combined, isLast := r.MergeData("db.col", &DataResult{
+		NS: "db.col", SrcCount: 5000, TgtCount: 5000,
+		CountIsExact: true, HashIsExact: true,
+	})
+	if !isLast {
+		t.Fatal("an unsplit namespace must complete on its first MergeData call")
+	}
+	if !combined.CountIsExact {
+		t.Error("CountIsExact = false, want true - a prior UpdateProgress call must not poison it")
+	}
+	if !combined.HashIsExact {
+		t.Error("HashIsExact = false, want true - a prior UpdateProgress call must not poison it")
+	}
+}
+
 func TestMergeData_SamplesCappedAcrossRanges(t *testing.T) {
 	r := New()
 	const ranges = 5

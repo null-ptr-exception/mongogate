@@ -55,7 +55,19 @@ type sharedProgress struct {
 	processed int64 // atomic
 	missing   int64 // atomic
 	different int64 // atomic
+
+	// lastRenderNS throttles bar.Update calls to roughly barRenderInterval,
+	// regardless of how many range workers share this bar or how fast they
+	// process documents. Without this, every range worker calling
+	// bar.Update on every single document serializes the whole scan behind
+	// progress.Bar's mutex + a synchronous stdout write per document - with
+	// N concurrent range workers that's N-way contention on one lock,
+	// measured to make a higher range_workers_per_collection perform worse
+	// than fewer, not better (the opposite of what range-split exists for).
+	lastRenderNS int64 // atomic
 }
+
+const barRenderInterval = 100 * time.Millisecond
 
 // VerifyAllData verifies every collection in parallel across MaxWorkers goroutines.
 func VerifyAllData(
@@ -555,10 +567,23 @@ func processSrcToTgt(
 // reportProgress updates the namespace's shared bar with the aggregate
 // processed count across every range (not just this task's own), so a
 // split collection's bar reflects real combined progress instead of one
-// range restarting the display from its own local count.
+// range restarting the display from its own local count. Actual renders
+// are throttled to barRenderInterval (see sharedProgress.lastRenderNS) -
+// a skipped call costs one atomic load, no lock, no stdout write, so this
+// stays cheap to call on every document even with many concurrent range
+// workers. bar.Done() (called once, when the namespace's last range
+// finishes) always renders a final 100% frame regardless of throttling.
 func reportProgress(sp *sharedProgress, aggregateProcessed int64) {
 	if sp == nil || sp.bar == nil {
 		return
+	}
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&sp.lastRenderNS)
+	if now-last < int64(barRenderInterval) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&sp.lastRenderNS, last, now) {
+		return // another goroutine just won the race to render
 	}
 	sp.bar.Update(aggregateProcessed)
 }
